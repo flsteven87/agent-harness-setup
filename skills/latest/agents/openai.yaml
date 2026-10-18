@@ -1,0 +1,6 @@
+interface:
+  display_name: "Latest"
+  short_description: "Align main exactly with remote and refresh the checkpoint"
+  default_prompt: "Use $latest to fetch updates and make local main equal the remote tip, preserve local-only commits on a retained branch and task worktrees in place, return an available detached primary checkout to main, and refresh Current State in the primary checkout's MEMORY.md."
+policy:
+  allow_implicit_invocation: true

@@ -1,0 +1,73 @@
+# Shared Codex settings. scripts/bootstrap.py merges these keys into ~/.codex/config.toml and
+# replaces {HOME} with the host's home directory. Codex owns the rest of that file: trusted
+# projects, plugins, hook trust, marketplaces, desktop state, and host app paths.
+model = "gpt-6.1-sol"
+model_reasoning_effort = "medium"
+forced_login_method = "chatgpt"
+personality = "pragmatic"
+service_tier = "default"
+web_search = "live"
+approval_policy = "on-request"
+sandbox_mode = "danger-full-access"
+approvals_reviewer = "auto_review"
+
+[features]
+hooks = true
+goals = true
+js_repl = false
+
+[agents]
+max_threads = 6
+max_depth = 1
+
+# Shared skills kept out of Codex; re-enable one by deleting its entry.
+[[skills.config]]
+path = "{HOME}/.agents/skills/computer-use/SKILL.md"
+enabled = false
+
+[[skills.config]]
+path = "{HOME}/.agents/skills/wait-what/SKILL.md"
+enabled = false
+
+[[skills.config]]
+path = "{HOME}/.agents/skills/teach/SKILL.md"
+enabled = false
+
+[[skills.config]]
+path = "{HOME}/.agents/skills/wayfinder/SKILL.md"
+enabled = false
+
+[[skills.config]]
+path = "{HOME}/.agents/skills/triage/SKILL.md"
+enabled = false
+
+[[skills.config]]
+path = "{HOME}/.agents/skills/to-questionnaire/SKILL.md"
+enabled = false
+
+[[skills.config]]
+path = "{HOME}/.agents/skills/seo-audit/SKILL.md"
+enabled = false
+
+[[skills.config]]
+path = "{HOME}/.agents/skills/setup-matt-pocock-skills/SKILL.md"
+enabled = false
+
+[mcp_servers.openaiDeveloperDocs]
+url = "https://developers.openai.com/mcp"
+
+[mcp_servers.openaiDeveloperDocs.tools.search_openai_docs]
+approval_mode = "approve"
+
+[mcp_servers.refero]
+url = "https://api.refero.design/mcp"
+
+[mcp_servers.code-review-graph]
+command = "{HOME}/.local/bin/code-review-graph-readonly"
+args = ["serve", "--tools", "get_minimal_context_tool,query_graph_tool,get_impact_radius_tool,get_review_context_tool,detect_changes_tool,get_architecture_overview_tool,list_graph_stats_tool"]
+enabled = false
+default_tools_approval_mode = "approve"
+
+[tui]
+status_line = ["current-dir", "model-with-reasoning", "context-used", "five-hour-limit", "weekly-limit"]
+status_line_use_colors = true

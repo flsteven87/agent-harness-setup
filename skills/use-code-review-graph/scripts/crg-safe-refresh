@@ -1,0 +1,434 @@
+#!/bin/zsh
+
+set -eu
+
+CRG_ISOLATED_BUILD="${HOME}/.local/bin/crg-isolated-build"
+CRG_PYTHON="${HOME}/.local/share/uv/tools/code-review-graph/bin/python"
+CRG_WRITER_SUPERVISOR="${HOME}/.local/bin/crg-writer-supervisor"
+
+DB_LIMIT_BYTES="${CRG_DB_LIMIT_BYTES:-1610612736}"
+MIN_FREE_BYTES="${CRG_MIN_FREE_BYTES:-8589934592}"
+WARN_FREE_BYTES="${CRG_WARN_FREE_BYTES:-42949672960}"
+REBUILD_HEADROOM_BYTES="${CRG_REBUILD_HEADROOM_BYTES:-5368709120}"
+WAL_LIMIT_BYTES="${CRG_WAL_LIMIT_BYTES:-268435456}"
+
+usage() {
+  echo "Usage:"
+  echo "  crg-safe-refresh audit REPO"
+  echo "  crg-safe-refresh build REPO"
+  echo "  crg-safe-refresh refresh REPO BASE"
+  echo "  crg-safe-refresh rebuild REPO"
+  echo "  crg-safe-refresh recover REPO"
+  echo "  crg-safe-refresh destroy REPO"
+}
+
+fail() {
+  echo "crg-safe-refresh: $*" >&2
+  exit 1
+}
+
+file_size() {
+  local file_path="$1"
+  if [[ -f "$file_path" ]]; then
+    stat -f '%z' "$file_path"
+  else
+    echo 0
+  fi
+}
+
+open_handle_count() {
+  local directory="$1"
+  if [[ -d "$directory" ]]; then
+    lsof +D "$directory" 2>/dev/null | awk 'NR > 1 { count++ } END { print count + 0 }'
+  else
+    echo 0
+  fi
+}
+
+available_bytes() {
+  local probe_path="$1"
+  df -Pk "$probe_path" | awk 'NR == 2 { print $4 * 1024 }'
+}
+
+quick_check() {
+  local database="$1"
+  "$CRG_PYTHON" -c '
+import sqlite3
+import sys
+
+connection = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro&immutable=1", uri=True)
+try:
+    print(connection.execute("PRAGMA quick_check").fetchone()[0])
+finally:
+    connection.close()
+' "$database"
+}
+
+fragmentation_stats() {
+  local database="$1"
+  "$CRG_PYTHON" -c '
+import json
+import sqlite3
+import sys
+
+connection = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro&immutable=1", uri=True)
+try:
+    page_size = connection.execute("PRAGMA page_size").fetchone()[0]
+    page_count = connection.execute("PRAGMA page_count").fetchone()[0]
+    freelist_count = connection.execute("PRAGMA freelist_count").fetchone()[0]
+    print(json.dumps({
+        "page_size": page_size,
+        "page_count": page_count,
+        "freelist_count": freelist_count,
+        "free_bytes": page_size * freelist_count,
+    }, separators=(",", ":")))
+finally:
+    connection.close()
+' "$database"
+}
+
+checkpoint_wal() {
+  local database="$1"
+  "$CRG_PYTHON" -c '
+import sqlite3
+import sys
+
+connection = sqlite3.connect(sys.argv[1], timeout=30, isolation_level=None)
+try:
+    busy, log_frames, checkpointed = connection.execute(
+        "PRAGMA wal_checkpoint(TRUNCATE)"
+    ).fetchone()
+    if busy != 0:
+        raise SystemExit(
+            f"WAL checkpoint remained busy: log={log_frames} checkpointed={checkpointed}"
+        )
+finally:
+    connection.close()
+' "$database"
+}
+
+assert_exact_graph_dir() {
+  local target="$1"
+  local expected_parent="$2"
+  local name="${target:t}"
+  [[ "$target:h" == "$expected_parent" ]] ||
+    fail "refusing graph directory outside repository: $target"
+  [[ "$name" == ".code-review-graph" ||
+     "$name" == ".code-review-graph.next" ||
+     "$name" == ".code-review-graph.previous" ]] ||
+    fail "refusing unexpected graph directory: $target"
+  [[ ! -L "$target" ]] || fail "refusing symlink graph directory: $target"
+}
+
+delete_graph_dir() {
+  local target="$1"
+  local expected_parent="$2"
+  [[ -d "$target" ]] || return 0
+  assert_exact_graph_dir "$target" "$expected_parent"
+  [[ "$(open_handle_count "$target")" -eq 0 ]] ||
+    fail "graph directory has open handles: $target"
+  find "$target" -depth -delete
+}
+
+validate_graph_dir() {
+  local target="$1"
+  local database="$target/graph.db"
+  local wal="$target/graph.db-wal"
+  [[ -f "$database" ]] || fail "graph database is missing: $database"
+  [[ "$(file_size "$database")" -le "$DB_LIMIT_BYTES" ]] ||
+    fail "graph database exceeds the per-worktree size limit: $database"
+  [[ "$(quick_check "$database")" == "ok" ]] ||
+    fail "SQLite quick_check failed: $database"
+  [[ "$(file_size "$wal")" -eq 0 ]] ||
+    fail "writer exited with a nonzero WAL: $wal"
+  [[ "$(open_handle_count "$target")" -eq 0 ]] ||
+    fail "graph still has open handles after writer exit: $target"
+}
+
+recover_swap_artifacts() {
+  local repo="$1"
+  local current="$repo/.code-review-graph"
+  local stage="$repo/.code-review-graph.next"
+  local previous="$repo/.code-review-graph.previous"
+
+  if [[ -d "$previous" ]]; then
+    if [[ -d "$current" ]]; then
+      validate_graph_dir "$current"
+      if [[ "$(open_handle_count "$previous")" -eq 0 ]]; then
+        delete_graph_dir "$previous" "$repo"
+      else
+        echo "retained_previous=$previous"
+      fi
+    else
+      validate_graph_dir "$previous"
+      mv "$previous" "$current"
+    fi
+  fi
+  if [[ -d "$stage" ]]; then
+    delete_graph_dir "$stage" "$repo"
+  fi
+}
+
+publish_stage() {
+  local repo="$1"
+  local stage="$repo/.code-review-graph.next"
+  local current="$repo/.code-review-graph"
+  local previous="$repo/.code-review-graph.previous"
+  validate_graph_dir "$stage"
+  [[ "$(open_handle_count "$current")" -eq 0 ]] ||
+    fail "old graph acquired an open handle before staged publish"
+  if [[ -d "$current" ]]; then
+    mv "$current" "$previous"
+  fi
+  if ! mv "$stage" "$current"; then
+    if [[ -d "$previous" && ! -e "$current" ]]; then
+      mv "$previous" "$current"
+    fi
+    fail "unable to publish staged graph generation"
+  fi
+  validate_graph_dir "$current"
+  if [[ -d "$previous" ]]; then
+    if [[ "$(open_handle_count "$previous")" -eq 0 ]]; then
+      delete_graph_dir "$previous" "$repo"
+    else
+      echo "retained_previous=$previous"
+    fi
+  fi
+}
+
+assert_writer_preconditions() {
+  local repo="$1"
+  local data_dir="$2"
+  local operation="$3"
+  local db="$data_dir/graph.db"
+  local wal="$data_dir/graph.db-wal"
+  local db_bytes
+  local wal_bytes
+  local open_handles
+  db_bytes="$(file_size "$db")"
+  wal_bytes="$(file_size "$wal")"
+  open_handles="$(open_handle_count "$data_dir")"
+
+  [[ ! -L "$data_dir" ]] || fail "refusing symlink graph directory"
+  [[ ! -L "$repo/.code-review-graph.next" ]] ||
+    fail "refusing symlink staging graph directory"
+  [[ ! -L "$repo/.code-review-graph.previous" ]] ||
+    fail "refusing symlink previous graph directory"
+  [[ "$open_handles" -eq 0 ]] ||
+    fail "graph has open handles; retry after readers close"
+  if pgrep -f '/code-review-graph (daemon start|watch)( |$)' >/dev/null 2>&1 ||
+     pgrep -f '(^|/)crg-daemon( |$)' >/dev/null 2>&1; then
+    fail "a raw CRG daemon or watcher is running"
+  fi
+  if pgrep -f '/code-review-graph (build|update)( |$)' >/dev/null 2>&1; then
+    fail "an unmanaged CRG build or update is running"
+  fi
+  if [[ "$operation" == "recover" ]]; then
+    (( wal_bytes <= WAL_LIMIT_BYTES )) ||
+      fail "graph WAL exceeds the guarded recovery limit"
+    (( db_bytes == 0 || wal_bytes <= db_bytes )) ||
+      fail "graph WAL is larger than the main database"
+  else
+    (( wal_bytes == 0 )) ||
+      fail "graph has a nonzero WAL; use guarded recovery first"
+  fi
+  (( $(available_bytes "$repo") >= MIN_FREE_BYTES )) ||
+    fail "less than the reserved free-space floor remains"
+}
+
+acquire_writer_lock() {
+  [[ "${CRG_WRITER_SUPERVISED:-}" == "1" ]] ||
+    fail "writer operation is not supervised"
+}
+
+release_writer_lock() {
+  return 0
+}
+
+mode="${1:-}"
+repo_arg="${2:-}"
+base="${3:-}"
+
+[[ "$mode" == "audit" || "$mode" == "build" || "$mode" == "refresh" ||
+   "$mode" == "rebuild" || "$mode" == "recover" || "$mode" == "destroy" ]] || {
+  usage
+  exit 2
+}
+[[ -n "$repo_arg" ]] || {
+  usage
+  exit 2
+}
+if [[ "$mode" != "audit" && "${CRG_WRITER_SUPERVISED:-}" != "1" ]]; then
+  exec "$CRG_WRITER_SUPERVISOR" "$0" "$@"
+fi
+[[ "$repo_arg" == /* ]] || fail "repository path must be absolute"
+case "$repo_arg" in
+  "$HOME"/*) ;;
+  *) fail "refusing repository outside the expected user root" ;;
+esac
+
+if [[ -d "$repo_arg" ]]; then
+  repo="$(cd "$repo_arg" 2>/dev/null && pwd -P)" ||
+    fail "unable to resolve repository: $repo_arg"
+else
+  repo="${repo_arg:A}"
+fi
+
+data_dir="$repo/.code-review-graph"
+db="$data_dir/graph.db"
+wal="$data_dir/graph.db-wal"
+shm="$data_dir/graph.db-shm"
+
+if [[ "$mode" != "destroy" ]]; then
+  [[ -d "$repo/.git" || -f "$repo/.git" ]] ||
+    fail "refusing non-Git or projectless directory: $repo"
+  resolved_root="$(git -C "$repo" rev-parse --show-toplevel 2>/dev/null)" ||
+    fail "unable to resolve Git worktree root: $repo"
+  [[ "${resolved_root:A}" == "$repo" ]] ||
+    fail "repository is not the exact Git worktree root: $repo"
+fi
+
+if [[ "$mode" != "audit" && "$mode" != "destroy" ]]; then
+  (( $(available_bytes "$repo") >= MIN_FREE_BYTES )) ||
+    fail "less than the reserved free-space floor remains"
+fi
+
+db_bytes="$(file_size "$db")"
+wal_bytes="$(file_size "$wal")"
+shm_bytes="$(file_size "$shm")"
+open_handles="$(open_handle_count "$data_dir")"
+free_bytes="$(available_bytes "${repo:h}")"
+quick="missing"
+fragmentation='{"page_size":0,"page_count":0,"freelist_count":0,"free_bytes":0}'
+if [[ -f "$db" ]]; then
+  quick="$(quick_check "$db" 2>/dev/null || echo error)"
+  fragmentation="$(fragmentation_stats "$db" 2>/dev/null || echo \
+    '{"page_size":0,"page_count":0,"freelist_count":0,"free_bytes":0}')"
+fi
+
+if [[ "$mode" == "audit" ]]; then
+  healthy=true
+  disk_warning=false
+  if (( free_bytes < WARN_FREE_BYTES )); then
+    disk_warning=true
+  fi
+  if (( wal_bytes > 0 )); then
+    healthy=false
+  fi
+  if (( open_handles > 0 )); then
+    healthy=false
+  fi
+  if (( free_bytes < MIN_FREE_BYTES )); then
+    healthy=false
+  fi
+  if [[ "$quick" != "ok" && "$quick" != "missing" ]]; then
+    healthy=false
+  fi
+  printf 'repo=%s\nhealthy=%s\ndb_bytes=%s\nwal_bytes=%s\nshm_bytes=%s\n' \
+    "$repo" "$healthy" "$db_bytes" "$wal_bytes" "$shm_bytes"
+  printf 'open_handles=%s\nfree_bytes=%s\ndisk_warning=%s\n' \
+    "$open_handles" "$free_bytes" "$disk_warning"
+  printf 'quick_check=%s\nfragmentation=%s\n' "$quick" "$fragmentation"
+  [[ "$healthy" == true ]]
+  exit
+fi
+
+if [[ "$mode" == "destroy" ]]; then
+  live_root="$(git -C "$repo" rev-parse --show-toplevel 2>/dev/null || true)"
+  if [[ -n "$live_root" ]] && [[ "${live_root:A}" == "$repo" ]]; then
+    fail "refusing to destroy the graph of a live Git worktree"
+  fi
+  acquire_writer_lock
+  trap release_writer_lock EXIT INT TERM
+  delete_graph_dir "$data_dir" "$repo"
+  delete_graph_dir "$repo/.code-review-graph.next" "$repo"
+  delete_graph_dir "$repo/.code-review-graph.previous" "$repo"
+  printf 'destroyed=%s\nrepo=%s\n' "$data_dir" "$repo"
+  exit
+fi
+
+assert_writer_preconditions "$repo" "$data_dir" "$mode"
+acquire_writer_lock
+trap release_writer_lock EXIT INT TERM
+if [[ "$mode" == "recover" && ( "$wal_bytes" -gt 0 || "$shm_bytes" -gt 0 ) ]]; then
+  [[ -f "$db" ]] || fail "cannot recover a WAL without graph.db"
+  checkpoint_wal "$db"
+  [[ "$(file_size "$wal")" -eq 0 ]] ||
+    fail "guarded WAL checkpoint did not truncate the WAL"
+fi
+if [[ "$mode" == "build" || "$mode" == "rebuild" || "$mode" == "recover" ]]; then
+  recover_swap_artifacts "$repo"
+fi
+
+if [[ "$mode" == "build" && -d "$data_dir" && ! -f "$db" ]]; then
+  delete_graph_dir "$data_dir" "$repo"
+fi
+
+if [[ "$mode" == "recover" ]]; then
+  if [[ -d "$data_dir" ]]; then
+    validate_graph_dir "$data_dir"
+  fi
+  printf 'recovered=true\nrepo=%s\n' "$repo"
+  exit
+fi
+
+case "$mode" in
+  build)
+    [[ ! -e "$data_dir" ]] || fail "graph directory already exists; use rebuild"
+    stage="$repo/.code-review-graph.next"
+    [[ ! -e "$stage" ]] || fail "staging graph already exists: $stage"
+    required_free="$REBUILD_HEADROOM_BYTES"
+    (( $(available_bytes "$repo") >= required_free )) ||
+      fail "insufficient free space for a fresh graph build"
+    if ! "$CRG_ISOLATED_BUILD" build "$repo" "$stage"; then
+      delete_graph_dir "$stage" "$repo"
+      fail "fresh graph build failed"
+    fi
+    publish_stage "$repo"
+    ;;
+  refresh)
+    [[ -f "$db" ]] || fail "graph.db is missing; use build"
+    (( db_bytes <= DB_LIMIT_BYTES )) ||
+      fail "graph.db exceeds the incremental-update size limit; use rebuild"
+    [[ -n "$base" ]] || fail "refresh requires an explicit Git review base"
+    git -C "$repo" rev-parse --verify "$base^{commit}" >/dev/null 2>&1 ||
+      fail "invalid Git review base: $base"
+    stage="$repo/.code-review-graph.next"
+    previous="$repo/.code-review-graph.previous"
+    [[ ! -e "$stage" ]] || fail "staging graph already exists: $stage"
+    [[ ! -e "$previous" ]] || fail "previous graph directory already exists: $previous"
+    required_free=$(( MIN_FREE_BYTES + db_bytes ))
+    (( $(available_bytes "$repo") >= required_free )) ||
+      fail "insufficient free space for a staged incremental refresh"
+    cp -cR "$data_dir" "$stage"
+    if ! "$CRG_ISOLATED_BUILD" update "$repo" "$stage" "$base"; then
+      delete_graph_dir "$stage" "$repo"
+      fail "staged incremental refresh failed"
+    fi
+    publish_stage "$repo"
+    ;;
+  rebuild)
+    stage="$repo/.code-review-graph.next"
+    previous="$repo/.code-review-graph.previous"
+    [[ ! -e "$stage" ]] || fail "staging graph already exists: $stage"
+    [[ ! -e "$previous" ]] || fail "previous graph directory already exists: $previous"
+    required_free=$(( db_bytes * 3 ))
+    if (( required_free < REBUILD_HEADROOM_BYTES )); then
+      required_free="$REBUILD_HEADROOM_BYTES"
+    fi
+    (( $(available_bytes "$repo") >= required_free )) ||
+      fail "insufficient free space for an atomic graph rebuild"
+    if ! "$CRG_ISOLATED_BUILD" build "$repo" "$stage"; then
+      delete_graph_dir "$stage" "$repo"
+      fail "fresh graph rebuild failed"
+    fi
+    publish_stage "$repo"
+    ;;
+esac
+
+validate_graph_dir "$data_dir"
+post_db_bytes="$(file_size "$db")"
+post_wal_bytes="$(file_size "$wal")"
+post_open_handles="$(open_handle_count "$data_dir")"
+printf 'quick_check=ok\ndb_bytes=%s\nwal_bytes=%s\nopen_handles=%s\n' \
+  "$post_db_bytes" "$post_wal_bytes" "$post_open_handles"

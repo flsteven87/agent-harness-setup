@@ -1,0 +1,29 @@
+# Runtime state. Holds production data snapshots and personal data.
+state/
+
+# Operational cache for the primary checkout. Holds local paths, unpushed SHAs, and
+# session observations; it is contextual cache, never authority over Git or the tracker.
+MEMORY.md
+
+# Python caches
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Browser automation cache
+.playwright-cli/
+
+# macOS
+.DS_Store
+.playwright-mcp/
+
+# Private operating notes and credentials stay local.
+/private/
+/research/
+/archive/
+.env
+.env.*
+!.env.example
+*.pem
+*.p12
+*.pfx

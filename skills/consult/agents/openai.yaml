@@ -1,0 +1,6 @@
+interface:
+  display_name: "Consult"
+  short_description: "Read-only second opinion from Claude Code"
+  default_prompt: "Use $consult to get Claude Code's second opinion on this change."
+policy:
+  allow_implicit_invocation: true

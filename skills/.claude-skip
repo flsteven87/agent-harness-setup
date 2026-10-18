@@ -1,0 +1,12 @@
+# Shared skills that ~/.claude/setup.sh does not link into Claude, one name per line.
+# code-review: Claude's built-in /code-review owns that name; the profile's $code-review
+#   resolution reads ~/.agents/skills/code-review/SKILL.md directly.
+code-review
+# ship: ~/.claude/commands/ship.md is the Claude adapter for /ship.
+ship
+# playwright: Claude drives browsers through the Playwright MCP.
+playwright
+# Codex-only workflows.
+engineering-report
+html-report-system
+housekeeping

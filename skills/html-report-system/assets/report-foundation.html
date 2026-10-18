@@ -1,0 +1,274 @@
+<!doctype html>
+<html lang="zh-Hant">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="color-scheme" content="light" />
+    <title>%%REPORT_IDENTITY%%</title>
+    <style>
+      :root {
+        --ink: #172221;
+        --muted: #596866;
+        --line: #d9e2df;
+        --paper: #ffffff;
+        --canvas: #f4f7f6;
+        --accent: #0f766e;
+        --accent-soft: #e4f3f0;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      html {
+        color: var(--ink);
+        background: var(--canvas);
+        font-family:
+          Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI",
+          "PingFang TC", "Noto Sans TC", sans-serif;
+        line-height: 1.65;
+      }
+
+      html:lang(zh-Hant) .report-copy {
+        line-break: strict;
+        word-break: normal;
+      }
+
+      body {
+        margin: 0;
+        background: var(--canvas);
+      }
+
+      a,
+      code,
+      .breakable {
+        overflow-wrap: anywhere;
+      }
+
+      a {
+        color: var(--accent);
+        text-underline-offset: 0.18em;
+      }
+
+      a:focus-visible,
+      summary:focus-visible {
+        border-radius: 4px;
+        outline: 3px solid rgba(15, 118, 110, 0.32);
+        outline-offset: 4px;
+      }
+
+      .page {
+        width: min(1180px, calc(100% - 40px));
+        margin: 0 auto;
+        padding: clamp(24px, 5vw, 56px) 0;
+      }
+
+      .report-header {
+        padding-bottom: clamp(28px, 5vw, 52px);
+        border-bottom: 1px solid var(--line);
+      }
+
+      h1,
+      h2,
+      h3,
+      p {
+        margin-top: 0;
+      }
+
+      h1 {
+        max-width: 18em;
+        margin-bottom: 14px;
+        font-size: clamp(2.25rem, 6vw, 4.8rem);
+        line-height: 1.02;
+        letter-spacing: -0.035em;
+        text-wrap: balance;
+      }
+
+      .report-thesis {
+        max-width: 36em;
+        margin-bottom: 14px;
+        color: var(--ink);
+        font-size: clamp(1.35rem, 3vw, 2.35rem);
+        font-weight: 720;
+        line-height: 1.18;
+      }
+
+      .report-summary {
+        max-width: 66em;
+        margin-bottom: 24px;
+        color: var(--muted);
+        font-size: clamp(1rem, 1.6vw, 1.15rem);
+      }
+
+      .meta-row {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+      }
+
+      .meta-chip {
+        display: inline-flex;
+        align-items: center;
+        min-height: 32px;
+        padding: 6px 10px;
+        border: 1px solid var(--line);
+        border-radius: 999px;
+        color: var(--muted);
+        background: var(--paper);
+        font-size: 0.82rem;
+        font-weight: 650;
+      }
+
+      [data-report-meta-token] {
+        overflow-wrap: normal;
+        white-space: nowrap;
+      }
+
+      main {
+        padding-top: clamp(34px, 6vw, 70px);
+      }
+
+      .report-copy > section + section {
+        margin-top: clamp(44px, 7vw, 82px);
+      }
+
+      .report-copy p,
+      .report-copy li {
+        max-width: 72ch;
+      }
+
+      html:lang(zh-Hant) .report-copy p,
+      html:lang(zh-Hant) .report-copy li {
+        max-width: 64em;
+      }
+
+      h2 {
+        margin-bottom: 12px;
+        font-size: clamp(1.5rem, 3vw, 2.25rem);
+        line-height: 1.2;
+        letter-spacing: -0.025em;
+      }
+
+      h3 {
+        margin-bottom: 8px;
+        font-size: 1.05rem;
+        line-height: 1.35;
+      }
+
+      .table-wrap {
+        max-width: 100%;
+        overflow-x: auto;
+        border: 1px solid var(--line);
+        border-radius: 12px;
+        background: var(--paper);
+      }
+
+      table {
+        width: 100%;
+        border-collapse: collapse;
+      }
+
+      th,
+      td {
+        padding: 13px 15px;
+        text-align: left;
+        vertical-align: top;
+        border-bottom: 1px solid var(--line);
+      }
+
+      th {
+        color: var(--ink);
+        background: var(--accent-soft);
+      }
+
+      tr:last-child td {
+        border-bottom: 0;
+      }
+
+      details {
+        padding: 14px 16px;
+        border: 1px solid var(--line);
+        border-radius: 12px;
+        background: var(--paper);
+      }
+
+      summary {
+        min-height: 44px;
+        cursor: pointer;
+        font-weight: 700;
+      }
+
+      @media (max-width: 640px) {
+        .page {
+          width: min(100% - 24px, 1180px);
+          padding-top: 18px;
+        }
+
+        h1 {
+          font-size: clamp(2rem, 12vw, 3.25rem);
+        }
+
+        .report-thesis {
+          font-size: clamp(1.25rem, 7vw, 1.8rem);
+        }
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        html {
+          scroll-behavior: auto;
+        }
+      }
+
+      @media print {
+        @page {
+          margin: 16mm;
+        }
+
+        body {
+          background: white;
+        }
+
+        .page {
+          width: 100%;
+          padding: 0;
+        }
+
+        a {
+          color: inherit;
+        }
+
+        details > :not(summary) {
+          display: block !important;
+        }
+
+        details::details-content {
+          content-visibility: visible !important;
+        }
+
+        .table-wrap {
+          overflow: visible;
+        }
+
+        .table-wrap table {
+          min-width: 0;
+          table-layout: fixed;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="page">
+      <header class="report-header" data-report-section="executive">
+        <h1 data-report-identity>%%REPORT_IDENTITY%%</h1>
+        <p class="report-thesis" data-report-thesis>%%REPORT_THESIS%%</p>
+        <p class="report-summary">%%REPORT_SUMMARY%%</p>
+        <div class="meta-row" aria-label="報告資訊">
+          <span class="meta-chip" data-report-meta-token>%%REPORT_STATUS%%</span>
+          <span class="meta-chip" data-report-meta-token>%%EVIDENCE_DATE%%</span>
+        </div>
+      </header>
+
+      <main class="report-copy">%%REPORT_BODY_HTML%%</main>
+    </div>
+  </body>
+</html>

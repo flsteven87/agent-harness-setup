@@ -1,0 +1,4 @@
+interface:
+  display_name: "Git Main Convergence"
+  short_description: "Audit and clean exact safe Git artifacts"
+  default_prompt: "Use $git-converge-main to clean owned Git artifacts, complete delivery already authorized in this conversation through $ship, and verify cleanup of every original target."

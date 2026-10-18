@@ -1,0 +1,6 @@
+interface:
+  display_name: "Handoff"
+  short_description: "Checkpoint work in shared project memory"
+  default_prompt: "Use $handoff to upsert this workstream in the primary checkout's MEMORY.md without overwriting checkpoints from concurrent sessions."
+policy:
+  allow_implicit_invocation: true

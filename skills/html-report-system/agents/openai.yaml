@@ -1,0 +1,4 @@
+interface:
+  display_name: "HTML Report System"
+  short_description: "Place lightweight reports under project docs policy"
+  default_prompt: "Use $html-report-system to place and validate a self-contained HTML report under the repository documentation policy."

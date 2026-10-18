@@ -1,0 +1,6 @@
+interface:
+  display_name: "Endgame"
+  short_description: "Carry work to its endgame under a goal contract"
+  default_prompt: "Use $endgame to carry this to the working profile's finish line."
+policy:
+  allow_implicit_invocation: true

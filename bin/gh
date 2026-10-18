@@ -1,0 +1,20 @@
+#!/bin/sh
+# Forward to the installed GitHub CLI using the caller's existing authentication.
+
+# The real gh is the first one on PATH that is not this wrapper (Homebrew on macOS, apt on Linux).
+self="$0"
+REAL_GH=
+IFS=:
+for dir in $PATH; do
+  if [ -x "$dir/gh" ] && ! [ "$dir/gh" -ef "$self" ]; then
+    REAL_GH="$dir/gh"
+    break
+  fi
+done
+unset IFS
+if [ -z "$REAL_GH" ]; then
+  echo "gh wrapper: no gh executable on PATH besides this wrapper" >&2
+  exit 127
+fi
+
+exec "$REAL_GH" "$@"

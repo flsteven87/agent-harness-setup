@@ -1,0 +1,104 @@
+#!/usr/bin/env python3
+"""Idempotently attach one Git/Orca worktree to the managed CRG lifecycle."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+
+LIFECYCLE = Path(
+    (
+        os.environ.get(
+            "CRG_LIFECYCLE_BIN", str(Path.home() / ".local/bin/crg-lifecycle")
+        )
+        if os.environ.get("CRG_TEST_MODE") == "1"
+        else str(Path.home() / ".local/bin/crg-lifecycle")
+    )
+)
+
+
+def git_worktree() -> Path:
+    result = subprocess.run(
+        ["git", "rev-parse", "--show-toplevel"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return Path(result.stdout.strip()).resolve(strict=True)
+
+
+def current_orca_instance_id() -> str | None:
+    """Return best-effort Orca metadata without making Orca authoritative."""
+    try:
+        result = subprocess.run(
+            ["orca", "worktree", "current", "--json"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return None
+    worktree = payload.get("result", {}).get("worktree", {})
+    instance_id = worktree.get("instanceId")
+    return instance_id if isinstance(instance_id, str) and instance_id else None
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("repo", nargs="?")
+    parser.add_argument("--orca-instance-id")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    arguments = build_parser().parse_args(argv)
+    if not LIFECYCLE.is_file():
+        print("crg-worktree-attach: CRG lifecycle is not installed; skipping")
+        return 0
+    try:
+        worktree = (
+            Path(arguments.repo).expanduser().resolve(strict=True)
+            if arguments.repo
+            else git_worktree()
+        )
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        print("crg-worktree-attach: not inside a live git worktree; skipping")
+        return 0
+
+    instance_id = arguments.orca_instance_id
+    if instance_id is None and arguments.repo is None:
+        instance_id = current_orca_instance_id()
+    command = [str(LIFECYCLE), "attach", str(worktree)]
+    if instance_id:
+        command.extend(["--orca-instance-id", instance_id])
+    result = subprocess.run(command, check=False)
+    if result.returncode != 0:
+        print(
+            f"crg-worktree-attach: lifecycle attach failed (exit {result.returncode})",
+            file=sys.stderr,
+        )
+        return result.returncode
+
+    print(
+        "crg-worktree-attach:\n"
+        f"  worktree : {worktree}\n"
+        f"  graph    : {worktree}/.code-review-graph/graph.db\n"
+        "  writer   : dormant registration; graph builds lazily when needed"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

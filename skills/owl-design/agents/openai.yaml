@@ -1,0 +1,7 @@
+interface:
+  display_name: "Owl Design"
+  short_description: "Switch explicitly to Owl design reasoning"
+  default_prompt: "Use $owl-design to solve this UI/UX task from the user flow and platform conventions."
+
+policy:
+  allow_implicit_invocation: false

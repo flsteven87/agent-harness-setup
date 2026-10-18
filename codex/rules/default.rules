@@ -1,0 +1,197 @@
+# Codex command safety rules (Starlark).
+# Docs: https://developers.openai.com/codex/rules
+
+# Pushing code is allowed after the user has asked the agent to publish changes.
+# Blind force forms are forbidden in favor of --force-with-lease; each repository's
+# branch protection decides which branches accept a force push at all. The flag is
+# only caught right after `push`; later positions still need the written policy.
+prefix_rule(
+    pattern=["git", "push", ["--force", "-f", "--mirror"]],
+    decision="forbidden",
+    justification="Use `git push --force-with-lease`, which refuses to overwrite remote commits you have not fetched.",
+    match=["git push --force origin feat", "git push -f", "git push --mirror"],
+    not_match=["git push --force-with-lease origin feat"],
+)
+
+prefix_rule(
+    pattern=["git", "push"],
+    decision="allow",
+    justification="The local workflow delegates verified repository publishing to Codex.",
+    match=["git push origin feature/my-branch"],
+)
+
+# Local commits are allowed.
+prefix_rule(
+    pattern=["git", "commit"],
+    decision="allow",
+    justification="Local commits record staged changes without modifying remote state.",
+    match=["git commit -m \"...\""],
+)
+
+prefix_rule(
+    pattern=["git", "rebase"],
+    decision="allow",
+    justification="The local workflow permits Codex to rebase when it is needed for repository maintenance.",
+    match=["git rebase main"],
+)
+
+prefix_rule(
+    pattern=["git", "reset", "--hard"],
+    decision="prompt",
+    justification="Hard reset can discard local changes.",
+    match=["git reset --hard HEAD~1"],
+)
+
+prefix_rule(
+    pattern=["git", "clean", "-fdx"],
+    decision="prompt",
+    justification="git clean -fdx permanently removes untracked files.",
+    match=["git clean -fdx"],
+)
+
+# Recursive or root-protection-bypassing deletes require confirmation.
+prefix_rule(
+    pattern=["rm", ["-rf", "-fr", "-r", "-R", "-Rf", "-fR", "--recursive"]],
+    decision="prompt",
+    justification="Recursive rm is unrecoverable; use `trash <path>`, which moves the tree to the macOS Trash.",
+    match=[
+        "rm -rf build/",
+        "rm -fr build/",
+        "rm -r build/",
+        "rm -R build/",
+        "rm --recursive build/",
+    ],
+    not_match=["rm file.txt"],
+)
+
+prefix_rule(
+    pattern=["rm", ["-f", "--force"], ["-r", "-R", "--recursive"]],
+    decision="prompt",
+    justification="Recursive rm is unrecoverable; use `trash <path>`, which moves the tree to the macOS Trash.",
+    match=[
+        "rm -f -r build/",
+        "rm --force --recursive build/",
+    ],
+)
+
+prefix_rule(
+    pattern=["rm", "--no-preserve-root"],
+    decision="prompt",
+    justification="Disabling root preservation can cause catastrophic deletion.",
+    match=["rm --no-preserve-root -rf /"],
+)
+
+prefix_rule(
+    pattern=["sudo"],
+    decision="prompt",
+    justification="sudo runs commands with elevated privileges; confirm intent.",
+    match=["sudo rm -rf /some/path"],
+)
+
+prefix_rule(
+    pattern=["chmod", "777"],
+    decision="prompt",
+    justification="chmod 777 is almost always unsafe; confirm intent and consider least privilege.",
+    match=["chmod 777 some-file"],
+)
+
+
+
+
+prefix_rule(
+    pattern=["shutdown"],
+    decision="prompt",
+    justification="shutdown affects system availability; confirm intent.",
+    match=["shutdown -h now"],
+)
+
+prefix_rule(
+    pattern=["reboot"],
+    decision="prompt",
+    justification="reboot affects system availability; confirm intent.",
+    match=["reboot"],
+)
+
+
+
+
+prefix_rule(
+    pattern=["csrutil"],
+    decision="prompt",
+    justification="csrutil changes system integrity protection settings; confirm intent.",
+    match=["csrutil status"],
+)
+
+prefix_rule(
+    pattern=["spctl"],
+    decision="prompt",
+    justification="spctl changes Gatekeeper policy; confirm intent.",
+    match=["spctl --status"],
+)
+
+# Prefer uv in uv-based Python projects (avoid bare pip installs).
+prefix_rule(
+    pattern=["pip", "install"],
+    decision="prompt",
+    justification="Prefer `uv add ...` in projects managed by uv. Use pip only when truly necessary.",
+    match=["pip install ruff"],
+)
+
+prefix_rule(
+    pattern=["pip3", "install"],
+    decision="prompt",
+    justification="Prefer `uv add ...` in projects managed by uv. Use pip only when truly necessary.",
+    match=["pip3 install ruff"],
+)
+
+prefix_rule(
+    pattern=["python", "-m", "pip"],
+    decision="prompt",
+    justification="Prefer `uv add ...` in projects managed by uv. Use pip only when truly necessary.",
+    match=["python -m pip install ruff"],
+)
+
+prefix_rule(
+    pattern=["python3", "-m", "pip"],
+    decision="prompt",
+    justification="Prefer `uv add ...` in projects managed by uv. Use pip only when truly necessary.",
+    match=["python3 -m pip install ruff"],
+)
+
+# High-risk disk operations should not be run.
+prefix_rule(
+    pattern=["mkfs"],
+    decision="forbidden",
+    justification="Disk formatting is destructive and out of scope for normal development tasks.",
+    match=["mkfs /dev/sda1"],
+)
+
+prefix_rule(
+    pattern=["dd"],
+    decision="prompt",
+    justification="dd can overwrite disks or large files if used incorrectly.",
+    match=["dd if=input.img of=/dev/sda"],
+)
+prefix_rule(pattern=["git", "fetch"], decision="allow")
+prefix_rule(pattern=["uv", "run", "pytest"], decision="allow")
+prefix_rule(pattern=["uv", "run", "python"], decision="allow")
+prefix_rule(pattern=["docker-compose", "up", "-d"], decision="allow")
+prefix_rule(pattern=["docker", "compose", "up", "-d"], decision="allow")
+prefix_rule(pattern=["uv", "run", "black"], decision="allow")
+prefix_rule(pattern=["uv", "run", "ruff"], decision="allow")
+prefix_rule(pattern=["git", "rm", "--cached"], decision="allow")
+prefix_rule(pattern=["git", "mv"], decision="allow")
+prefix_rule(pattern=["git", "stash", "drop"], decision="allow")
+prefix_rule(pattern=["git", "add", "-u"], decision="allow")
+prefix_rule(pattern=["git", "add"], decision="allow")
+prefix_rule(pattern=["codex", "--version"], decision="allow")
+prefix_rule(pattern=["supabase", "--version"], decision="allow")
+prefix_rule(pattern=["npm", "test"], decision="allow")
+
+# Read-only inspection runs outside the sandbox so chained reads with an allowed
+# command (`git fetch && git status`) do not escalate on the unruled segment.
+prefix_rule(pattern=["git", ["status", "rev-parse", "ls-remote", "log", "diff", "show", "branch", "remote"]], decision="allow")
+prefix_rule(pattern=["git", "worktree", "list"], decision="allow")
+prefix_rule(pattern=["gh", "pr", ["view", "checks", "list", "diff"]], decision="allow")
+prefix_rule(pattern=["gh", "run", ["view", "watch", "list"]], decision="allow")
+prefix_rule(pattern=["crg-lifecycle", "enqueue"], decision="allow")

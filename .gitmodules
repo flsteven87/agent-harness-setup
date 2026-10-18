@@ -1,0 +1,4 @@
+[submodule "vendor/owl-designer-skills"]
+	path = vendor/owl-designer-skills
+	url = https://github.com/Owl-Listener/designer-skills.git
+	branch = main

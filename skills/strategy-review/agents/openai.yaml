@@ -1,0 +1,4 @@
+interface:
+  display_name: "Strategy Review"
+  short_description: "Build evidence-backed product and engineering strategy"
+  default_prompt: "Use $strategy-review to investigate this topic and produce an evidence-backed product and engineering strategy."

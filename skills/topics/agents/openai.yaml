@@ -1,0 +1,4 @@
+interface:
+  display_name: "Topics"
+  short_description: "Choose the next engineering outcome to pursue"
+  default_prompt: "Use $topics to compare our current engineering topics and recommend what deserves attention next."

@@ -1,0 +1,6 @@
+interface:
+  display_name: "Catch Up"
+  short_description: "Resume from shared project memory"
+  default_prompt: "Use $catchup to select and reconcile one keyed workstream from the primary checkout's MEMORY.md, then recommend its safest next action."
+policy:
+  allow_implicit_invocation: true

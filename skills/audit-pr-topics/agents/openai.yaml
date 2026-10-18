@@ -1,0 +1,4 @@
+interface:
+  display_name: "Audit PR Topics"
+  short_description: "Audit PR topics, risks, outlook, and data work"
+  default_prompt: "Use $audit-pr-topics to audit my PR topics, regression risk, data work, and remaining tickets."

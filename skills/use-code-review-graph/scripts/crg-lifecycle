@@ -1,0 +1,2221 @@
+#!/usr/bin/env python3
+"""Lifecycle coordinator for per-worktree code-review-graph databases."""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import datetime as dt
+import fcntl
+import hashlib
+import json
+import os
+import signal
+import sqlite3
+import subprocess
+import sys
+import threading
+import uuid
+from collections.abc import Iterator
+from pathlib import Path
+from typing import Any
+
+TEST_MODE = os.environ.get("CRG_TEST_MODE") == "1"
+
+
+def test_override(name: str, default: str) -> str:
+    return os.environ.get(name, default) if TEST_MODE else default
+
+
+USER_ROOT = Path(test_override("CRG_USER_ROOT", str(Path.home()))).expanduser().resolve()
+CONTROL_ROOT = Path(
+    test_override("CRG_CONTROL_ROOT", str(USER_ROOT / ".code-review-graph"))
+).expanduser().resolve()
+CONTROL_DB_PATH = CONTROL_ROOT / "control.db"
+CONTROL_INIT_LOCK_PATH = Path(
+    test_override("CRG_CONTROL_INIT_LOCK", str(CONTROL_ROOT / "control-init.lock"))
+)
+COORDINATOR_LOCK_PATH = Path(
+    test_override(
+        "CRG_COORDINATOR_LOCK", str(CONTROL_ROOT / "lifecycle-coordinator.lock")
+    )
+)
+WORKTREE_LOCK_DIR = Path(
+    test_override("CRG_WORKTREE_LOCK_DIR", str(CONTROL_ROOT / "locks"))
+)
+SAFE_REFRESH = Path(
+    test_override("CRG_SAFE_REFRESH", str(USER_ROOT / ".local/bin/crg-safe-refresh"))
+)
+CRG_BIN = Path(
+    test_override("CRG_BIN", str(USER_ROOT / ".local/bin/code-review-graph"))
+)
+CRG_PYTHON = Path(
+    test_override(
+        "CRG_PYTHON",
+        str(USER_ROOT / ".local/share/uv/tools/code-review-graph/bin/python"),
+    )
+)
+LAUNCH_LABEL = test_override(
+    "CRG_LAUNCH_LABEL", "com.code-review-graph.safe-refresh"
+)
+
+MAX_CHANGED_FILES = int(os.environ.get("CRG_MAX_CHANGED_FILES", "500"))
+MAX_CHANGED_RATIO = float(os.environ.get("CRG_MAX_CHANGED_RATIO", "0.15"))
+MAX_FRAGMENTATION_RATIO = float(os.environ.get("CRG_MAX_FRAGMENTATION_RATIO", "0.20"))
+DB_LIMIT_BYTES = int(os.environ.get("CRG_DB_LIMIT_BYTES", str(1536 * 1024 * 1024)))
+TOTAL_GRAPH_LIMIT_BYTES = int(
+    os.environ.get("CRG_TOTAL_GRAPH_LIMIT_BYTES", str(10 * 1024 * 1024 * 1024))
+)
+COMMAND_TIMEOUT_SECONDS = int(os.environ.get("CRG_COMMAND_TIMEOUT_SECONDS", "1800"))
+MAX_ITEMS_PER_RUN = max(1, int(os.environ.get("CRG_MAX_ITEMS_PER_RUN", "4")))
+GRAPH_PROVISION_REASONS = {"agent:graph-needed", "manual:build"}
+STALE_SWEEP_REASON = "lifecycle:stale-graph"
+VERSION_SWEEP_REASON = "lifecycle:version-drift"
+MIN_FREE_BYTES = int(os.environ.get("CRG_MIN_FREE_BYTES", str(8 * 1024**3)))
+RESUME_FREE_BYTES = int(
+    os.environ.get("CRG_RESUME_FREE_BYTES", str(10 * 1024**3))
+)
+BACKOFF_BASE_SECONDS = int(os.environ.get("CRG_BACKOFF_BASE_SECONDS", "900"))
+BACKOFF_MAX_SECONDS = int(os.environ.get("CRG_BACKOFF_MAX_SECONDS", "21600"))
+OUTCOME_RETENTION = max(100, int(os.environ.get("CRG_OUTCOME_RETENTION", "2000")))
+ORPHAN_GRACE_SECONDS = max(
+    0, int(os.environ.get("CRG_ORPHAN_GRACE_SECONDS", "86400"))
+)
+ORPHAN_CONFIRMATIONS = max(
+    2, int(os.environ.get("CRG_ORPHAN_CONFIRMATIONS", "2"))
+)
+_READY_CONTROL_DATABASES: set[Path] = set()
+
+
+class LifecycleError(RuntimeError):
+    """A bounded lifecycle failure with an actionable message."""
+
+
+def now_iso() -> str:
+    return dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")  # noqa: UP017
+
+
+def run(
+    arguments: list[str],
+    *,
+    cwd: Path | None = None,
+    timeout: int = 30,
+    check: bool = True,
+) -> subprocess.CompletedProcess[str]:
+    process = subprocess.Popen(
+        arguments,
+        cwd=str(cwd) if cwd else None,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        stdin=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    previous_handlers: dict[signal.Signals, Any] = {}
+
+    def forward_termination(signum: int, _frame: object) -> None:
+        if process.poll() is None:
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                process.wait()
+        raise SystemExit(128 + signum)
+
+    if threading.current_thread() is threading.main_thread():
+        for termination_signal in (signal.SIGTERM, signal.SIGINT):
+            previous_handlers[termination_signal] = signal.signal(
+                termination_signal,
+                forward_termination,
+            )
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired as error:
+        os.killpg(process.pid, signal.SIGTERM)
+        try:
+            stdout, stderr = process.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, signal.SIGKILL)
+            stdout, stderr = process.communicate()
+        raise subprocess.TimeoutExpired(
+            arguments,
+            timeout,
+            output=stdout,
+            stderr=stderr,
+        ) from error
+    finally:
+        for termination_signal, previous_handler in previous_handlers.items():
+            signal.signal(termination_signal, previous_handler)
+    result = subprocess.CompletedProcess(
+        arguments,
+        process.returncode,
+        stdout,
+        stderr,
+    )
+    if check and result.returncode != 0:
+        detail = (
+            result.stderr.strip()
+            or result.stdout.strip()
+            or f"exit {result.returncode}"
+        )
+        raise LifecycleError(f"{' '.join(arguments)} failed: {detail}")
+    return result
+
+
+def canonical_live_worktree(repo_arg: str | Path) -> Path:
+    candidate = Path(repo_arg).expanduser().resolve(strict=True)
+    if candidate == USER_ROOT or USER_ROOT not in candidate.parents:
+        raise LifecycleError(
+            f"repository is outside the expected user root: {candidate}"
+        )
+    root = Path(
+        run(
+            ["git", "-C", str(candidate), "rev-parse", "--show-toplevel"]
+        ).stdout.strip()
+    ).resolve(strict=True)
+    if root != candidate:
+        raise LifecycleError(f"path is not the exact Git worktree root: {candidate}")
+    return root
+
+
+def git_value(repo: Path, *arguments: str, required: bool = True) -> str:
+    result = run(
+        ["git", "-C", str(repo), *arguments],
+        check=required,
+    )
+    return result.stdout.strip()
+
+
+def worktree_identity(repo: Path) -> dict[str, Any]:
+    git_dir = Path(
+        git_value(repo, "rev-parse", "--path-format=absolute", "--git-dir")
+    ).resolve(strict=True)
+    common_dir = Path(
+        git_value(repo, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    ).resolve(strict=True)
+    branch_result = run(
+        ["git", "-C", str(repo), "symbolic-ref", "--quiet", "--short", "HEAD"],
+        check=False,
+    )
+    git_dir_stat = git_dir.stat()
+    common_dir_stat = common_dir.stat()
+    return {
+        "path": str(repo),
+        "git_dir": str(git_dir),
+        "git_common_dir": str(common_dir),
+        "git_dir_device": git_dir_stat.st_dev,
+        "git_dir_inode": git_dir_stat.st_ino,
+        "git_common_dir_device": common_dir_stat.st_dev,
+        "git_common_dir_inode": common_dir_stat.st_ino,
+        "head": git_value(repo, "rev-parse", "HEAD"),
+        "branch": branch_result.stdout.strip() or "(detached)",
+    }
+
+
+def is_live_worktree(repo_path: str, expected: dict[str, Any] | None = None) -> bool:
+    try:
+        repo = canonical_live_worktree(repo_path)
+        identity = worktree_identity(repo)
+    except (FileNotFoundError, LifecycleError, subprocess.SubprocessError):
+        return False
+    if expected and not stable_identity_matches(expected, identity):
+        return False
+    return True
+
+
+def available_bytes(path: Path = USER_ROOT) -> int:
+    """Return free bytes without traversing repositories or graph databases."""
+    stats = os.statvfs(path)
+    return stats.f_bavail * stats.f_frsize
+
+
+def parse_iso(value: object) -> dt.datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = dt.datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    return parsed
+
+
+@contextlib.contextmanager
+def file_lock(path: Path, *, blocking: bool = True) -> Iterator[None]:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+", encoding="utf-8") as handle:
+        flags = fcntl.LOCK_EX
+        if not blocking:
+            flags |= fcntl.LOCK_NB
+        try:
+            fcntl.flock(handle.fileno(), flags)
+        except BlockingIOError as error:
+            raise LifecycleError(f"lock is already held: {path}") from error
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def worktree_lock_path(repo: Path | str) -> Path:
+    canonical_repo = Path(repo).expanduser().resolve(strict=False)
+    digest = hashlib.sha256(str(canonical_repo).encode("utf-8")).hexdigest()
+    return WORKTREE_LOCK_DIR / f"{digest}.flock"
+
+
+def ensure_worktree_lock(repo: Path | str) -> Path:
+    path = worktree_lock_path(repo)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.is_symlink():
+        raise LifecycleError(f"worktree lock is a symlink: {path}")
+    path.touch(exist_ok=True)
+    return path
+
+
+@contextlib.contextmanager
+def worktree_read_lock(repo: Path) -> Iterator[None]:
+    path = worktree_lock_path(repo)
+    if not path.is_file() or path.is_symlink():
+        raise LifecycleError("worktree lifecycle lock is unavailable")
+    with path.open("r", encoding="utf-8") as handle:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise LifecycleError("worktree refresh is in progress") from error
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+CONTROL_SCHEMA = """
+CREATE TABLE IF NOT EXISTS worktrees (
+    repo TEXT PRIMARY KEY,
+    entry_json TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS work_items (
+    repo TEXT PRIMARY KEY,
+    event_id TEXT NOT NULL,
+    generation INTEGER NOT NULL,
+    reasons_json TEXT NOT NULL,
+    provision_required INTEGER NOT NULL,
+    enqueued_at TEXT NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at TEXT,
+    lease_id TEXT,
+    lease_expires_at TEXT
+);
+CREATE TABLE IF NOT EXISTS outcomes (
+    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+    repo TEXT NOT NULL,
+    generation INTEGER NOT NULL,
+    event_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    detail_json TEXT NOT NULL,
+    recorded_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS system_state (
+    key TEXT PRIMARY KEY,
+    value_json TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+"""
+
+
+def initialize_control_db() -> None:
+    """Create the control plane only for an explicitly mutating operation."""
+    CONTROL_ROOT.mkdir(parents=True, exist_ok=True)
+    os.chmod(CONTROL_ROOT, 0o700)
+    connection = sqlite3.connect(CONTROL_DB_PATH, timeout=5, isolation_level=None)
+    try:
+        connection.execute("PRAGMA busy_timeout=5000")
+        connection.execute("PRAGMA journal_mode=DELETE")
+        connection.execute("PRAGMA synchronous=FULL")
+        connection.execute("PRAGMA foreign_keys=ON")
+        connection.executescript(CONTROL_SCHEMA)
+    finally:
+        connection.close()
+    os.chmod(CONTROL_DB_PATH, 0o600)
+
+
+def control_connection(*, write: bool = False) -> sqlite3.Connection:
+    if write:
+        ensure_control_db()
+    if not CONTROL_DB_PATH.is_file() or CONTROL_DB_PATH.is_symlink():
+        raise LifecycleError("CRG control database is unavailable")
+    if write:
+        connection = sqlite3.connect(CONTROL_DB_PATH, timeout=5, isolation_level=None)
+    else:
+        connection = sqlite3.connect(
+            f"{CONTROL_DB_PATH.as_uri()}?mode=ro", uri=True, timeout=5,
+            isolation_level=None,
+        )
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA busy_timeout=5000")
+    connection.execute("PRAGMA foreign_keys=ON")
+    if write:
+        connection.execute("PRAGMA synchronous=FULL")
+        connection.execute("BEGIN IMMEDIATE")
+    else:
+        connection.execute("PRAGMA query_only=ON")
+    return connection
+
+
+def ensure_control_db() -> None:
+    if CONTROL_DB_PATH in _READY_CONTROL_DATABASES and CONTROL_DB_PATH.is_file():
+        return
+    with file_lock(CONTROL_INIT_LOCK_PATH):
+        initialize_control_db()
+        _READY_CONTROL_DATABASES.add(CONTROL_DB_PATH)
+
+
+def load_state_unlocked() -> dict[str, Any]:
+    if not CONTROL_DB_PATH.exists():
+        return {"version": 2, "worktrees": {}}
+    connection = control_connection()
+    try:
+        worktrees = {
+            row["repo"]: json.loads(row["entry_json"])
+            for row in connection.execute("SELECT repo, entry_json FROM worktrees")
+        }
+        circuit_row = connection.execute(
+            "SELECT value_json FROM system_state WHERE key='disk_circuit'"
+        ).fetchone()
+        state: dict[str, Any] = {"version": 2, "worktrees": worktrees}
+        if circuit_row:
+            state["disk_circuit"] = json.loads(circuit_row[0])
+        return state
+    finally:
+        connection.close()
+
+
+def update_state_entry(repo_path: str, entry: dict[str, Any] | None) -> None:
+    ensure_control_db()
+    connection = control_connection(write=True)
+    try:
+        if entry is None:
+            connection.execute("DELETE FROM worktrees WHERE repo=?", (repo_path,))
+        else:
+            connection.execute(
+                """INSERT INTO worktrees(repo, entry_json, updated_at) VALUES (?, ?, ?)
+                   ON CONFLICT(repo) DO UPDATE SET
+                   entry_json=excluded.entry_json, updated_at=excluded.updated_at""",
+                (repo_path, json.dumps(entry, sort_keys=True), now_iso()),
+            )
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def read_state() -> dict[str, Any]:
+    return load_state_unlocked()
+
+
+def read_state_readonly() -> dict[str, Any]:
+    return load_state_unlocked()
+
+
+def kick_coordinator() -> None:
+    """Best-effort wake after the queue event is durably persisted."""
+    uid = os.getuid()
+    try:
+        run(
+            ["launchctl", "kickstart", f"gui/{uid}/{LAUNCH_LABEL}"],
+            check=False,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        # Enqueue success is defined by the durable state and queue writes.
+        # StartInterval provides the bounded retry path.
+        return
+
+
+def normalize_queue_event(payload: dict[str, Any]) -> dict[str, Any]:
+    """Upgrade a legacy event in memory without adding a second queue format."""
+    reasons = payload.get("reasons")
+    if not isinstance(reasons, list):
+        legacy_reason = payload.get("reason")
+        reasons = [legacy_reason] if isinstance(legacy_reason, str) else []
+    reasons = [reason for reason in reasons if isinstance(reason, str)][-16:]
+    generation = payload.get("generation", 1)
+    attempts = payload.get("attempts", 0)
+    return {
+        **payload,
+        "generation": generation if isinstance(generation, int) else 1,
+        "reasons": reasons,
+        "reason": reasons[-1] if reasons else "unknown",
+        "provision_required": bool(payload.get("provision_required"))
+        or any(reason in GRAPH_PROVISION_REASONS for reason in reasons),
+        "attempts": attempts if isinstance(attempts, int) else 0,
+        "next_attempt_at": payload.get("next_attempt_at"),
+    }
+
+
+def stable_identity_matches(entry: dict[str, Any], identity: dict[str, Any]) -> bool:
+    keys = (
+        "git_dir_device",
+        "git_dir_inode",
+        "git_common_dir_device",
+        "git_common_dir_inode",
+    )
+    if all(entry.get(key) is not None for key in keys):
+        return all(entry.get(key) == identity.get(key) for key in keys)
+    return (
+        entry.get("git_dir") == identity.get("git_dir")
+        and entry.get("git_common_dir") == identity.get("git_common_dir")
+    )
+
+
+def attach(repo_arg: str, *, orca_instance_id: str | None = None) -> dict[str, Any]:
+    """Idempotently bind one live Git worktree without provisioning its graph."""
+    repo = canonical_live_worktree(repo_arg)
+    if install_hooks(str(repo), dry_run=False) != 0:
+        raise LifecycleError("unable to install managed Git hooks")
+    ensure_worktree_lock(repo)
+    identity = worktree_identity(repo)
+    ensure_control_db()
+    connection = control_connection(write=True)
+    try:
+        rows = connection.execute("SELECT repo, entry_json FROM worktrees").fetchall()
+        prior_path: str | None = None
+        prior: dict[str, Any] = {}
+        reused_path = False
+        for row in rows:
+            candidate = json.loads(row["entry_json"])
+            if row["repo"] == str(repo):
+                if stable_identity_matches(candidate, identity):
+                    prior_path = row["repo"]
+                    prior = candidate
+                    break
+                reused_path = True
+                continue
+            if stable_identity_matches(candidate, identity):
+                prior_path = row["repo"]
+                prior = candidate
+
+        if reused_path:
+            connection.execute("DELETE FROM work_items WHERE repo=?", (str(repo),))
+            connection.execute("DELETE FROM worktrees WHERE repo=?", (str(repo),))
+        if prior_path and prior_path != str(repo):
+            connection.execute(
+                "UPDATE work_items SET repo=? WHERE repo=?", (str(repo), prior_path)
+            )
+            connection.execute(
+                "UPDATE outcomes SET repo=? WHERE repo=?", (str(repo), prior_path)
+            )
+            connection.execute("DELETE FROM worktrees WHERE repo=?", (prior_path,))
+
+        state = str(prior.get("state") or "dormant")
+        if state == "orphaned":
+            state = str(prior.get("state_before_orphan") or "dormant")
+        entry = {
+            **prior,
+            **identity,
+            "lifecycle_id": prior.get("lifecycle_id") or str(uuid.uuid4()),
+            "state": state,
+            "last_seen_at": now_iso(),
+        }
+        for key in (
+            "orphaned_at",
+            "missing_confirmations",
+            "state_before_orphan",
+        ):
+            entry.pop(key, None)
+        if orca_instance_id:
+            entry["orca_instance_id"] = orca_instance_id
+        connection.execute(
+            """INSERT INTO worktrees(repo, entry_json, updated_at) VALUES (?, ?, ?)
+               ON CONFLICT(repo) DO UPDATE SET
+               entry_json=excluded.entry_json, updated_at=excluded.updated_at""",
+            (str(repo), json.dumps(entry, sort_keys=True), now_iso()),
+        )
+        connection.commit()
+        return entry
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def enqueue(repo_arg: str, reason: str, *, kick: bool = True) -> dict[str, Any]:
+    repo = canonical_live_worktree(repo_arg)
+    ensure_worktree_lock(repo)
+    identity = worktree_identity(repo)
+    ensure_control_db()
+    connection = control_connection(write=True)
+    try:
+        row = connection.execute(
+            "SELECT entry_json FROM worktrees WHERE repo=?", (str(repo),)
+        ).fetchone()
+        prior = json.loads(row[0]) if row else {}
+        if prior and not stable_identity_matches(prior, identity):
+            prior = {}
+            connection.execute("DELETE FROM work_items WHERE repo=?", (str(repo),))
+        prior_event_row = connection.execute(
+            "SELECT * FROM work_items WHERE repo=?", (str(repo),)
+        ).fetchone()
+        prior_event = row_to_event(prior_event_row) if prior_event_row else {}
+        reasons = list(prior_event.get("reasons", []))
+        if reason not in reasons:
+            reasons.append(reason)
+        reasons = reasons[-16:]
+        event = {
+            "id": str(uuid.uuid4()),
+            "generation": int(prior_event.get("generation", 0)) + 1,
+            "repo": str(repo),
+            "reason": reason,
+            "reasons": reasons,
+            "provision_required": bool(prior_event.get("provision_required"))
+            or reason in GRAPH_PROVISION_REASONS,
+            "enqueued_at": now_iso(),
+            "attempts": 0,
+            "next_attempt_at": None,
+        }
+        entry = {
+            **prior,
+            **identity,
+            "lifecycle_id": prior.get("lifecycle_id") or str(uuid.uuid4()),
+            "state": "pending",
+            "last_seen_at": now_iso(),
+            "last_event": reason,
+        }
+        for key in ("orphaned_at", "missing_confirmations", "state_before_orphan"):
+            entry.pop(key, None)
+        connection.execute(
+            """INSERT INTO worktrees(repo, entry_json, updated_at) VALUES (?, ?, ?)
+               ON CONFLICT(repo) DO UPDATE SET
+               entry_json=excluded.entry_json, updated_at=excluded.updated_at""",
+            (str(repo), json.dumps(entry, sort_keys=True), now_iso()),
+        )
+        upsert_queue_event(connection, event)
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+    if kick and os.environ.get("CRG_LIFECYCLE_NO_KICK") != "1":
+        kick_coordinator()
+    return event
+
+
+def read_queue_event(repo: Path) -> dict[str, Any] | None:
+    ensure_control_db()
+    connection = control_connection()
+    try:
+        row = connection.execute(
+            "SELECT * FROM work_items WHERE repo=?", (str(repo),)
+        ).fetchone()
+        return row_to_event(row) if row else None
+    finally:
+        connection.close()
+
+
+def row_to_event(row: sqlite3.Row) -> dict[str, Any]:
+    reasons = json.loads(row["reasons_json"])
+    return {
+        "id": row["event_id"],
+        "generation": row["generation"],
+        "repo": row["repo"],
+        "reason": reasons[-1] if reasons else "unknown",
+        "reasons": reasons,
+        "provision_required": bool(row["provision_required"]),
+        "enqueued_at": row["enqueued_at"],
+        "attempts": row["attempts"],
+        "next_attempt_at": row["next_attempt_at"],
+        "lease_id": row["lease_id"],
+        "lease_expires_at": row["lease_expires_at"],
+    }
+
+
+def upsert_queue_event(
+    connection: sqlite3.Connection, event: dict[str, Any]
+) -> None:
+    connection.execute(
+        """INSERT INTO work_items
+           (repo, event_id, generation, reasons_json, provision_required,
+            enqueued_at, attempts, next_attempt_at, lease_id, lease_expires_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(repo) DO UPDATE SET
+           event_id=excluded.event_id, generation=excluded.generation,
+           reasons_json=excluded.reasons_json,
+           provision_required=excluded.provision_required,
+           enqueued_at=excluded.enqueued_at, attempts=excluded.attempts,
+           next_attempt_at=excluded.next_attempt_at,
+           lease_id=excluded.lease_id, lease_expires_at=excluded.lease_expires_at""",
+        (
+            event["repo"], event["id"], event["generation"],
+            json.dumps(event["reasons"]), int(event["provision_required"]),
+            event["enqueued_at"], event.get("attempts", 0),
+            event.get("next_attempt_at"), event.get("lease_id"),
+            event.get("lease_expires_at"),
+        ),
+    )
+
+
+def store_queue_event(event: dict[str, Any]) -> None:
+    ensure_control_db()
+    connection = control_connection(write=True)
+    try:
+        upsert_queue_event(connection, normalize_queue_event(event))
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def queued_events(*, quarantine_invalid: bool = False) -> dict[str, dict[str, Any]]:
+    """Snapshot desired-state rows from the single control-plane authority."""
+    del quarantine_invalid
+    ensure_control_db()
+    connection = control_connection()
+    try:
+        return {
+            row["repo"]: row_to_event(row)
+            for row in connection.execute("SELECT * FROM work_items ORDER BY repo")
+        }
+    finally:
+        connection.close()
+
+
+def remove_state_and_queue(repo_path: str) -> None:
+    """Forget lifecycle state and desired work in one transaction."""
+    ensure_control_db()
+    connection = control_connection(write=True)
+    try:
+        connection.execute("DELETE FROM work_items WHERE repo=?", (repo_path,))
+        connection.execute("DELETE FROM worktrees WHERE repo=?", (repo_path,))
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def ignore_hash(repo: Path) -> str:
+    path = repo / ".code-review-graphignore"
+    digest = hashlib.sha256()
+    if path.exists():
+        digest.update(path.read_bytes())
+    return digest.hexdigest()
+
+
+def crg_version() -> str:
+    output = run([str(CRG_BIN), "--version"]).stdout.strip()
+    return output.rsplit(" ", 1)[-1]
+
+
+def graph_schema_version(database: Path) -> str:
+    if not database.exists():
+        return ""
+    connection = sqlite3.connect(
+        f"{database.resolve(strict=True).as_uri()}?mode=ro&immutable=1", uri=True
+    )
+    try:
+        row = connection.execute(
+            "SELECT value FROM metadata WHERE key = 'schema_version'"
+        ).fetchone()
+        return str(row[0]) if row else ""
+    finally:
+        connection.close()
+
+
+def graph_fragmentation(database: Path) -> dict[str, int | float]:
+    connection = sqlite3.connect(
+        f"{database.resolve(strict=True).as_uri()}?mode=ro&immutable=1", uri=True
+    )
+    try:
+        page_size = int(connection.execute("PRAGMA page_size").fetchone()[0])
+        page_count = int(connection.execute("PRAGMA page_count").fetchone()[0])
+        freelist = int(connection.execute("PRAGMA freelist_count").fetchone()[0])
+    finally:
+        connection.close()
+    ratio = freelist / page_count if page_count else 0.0
+    return {
+        "page_size": page_size,
+        "page_count": page_count,
+        "freelist_count": freelist,
+        "free_bytes": page_size * freelist,
+        "ratio": ratio,
+    }
+
+
+def graph_quick_check(database: Path) -> str:
+    connection = sqlite3.connect(
+        f"{database.resolve(strict=True).as_uri()}?mode=ro&immutable=1", uri=True
+    )
+    try:
+        row = connection.execute("PRAGMA quick_check").fetchone()
+        return str(row[0]) if row else "missing"
+    finally:
+        connection.close()
+
+
+def graph_artifact_identity(database: Path) -> dict[str, int | str]:
+    resolved = database.resolve(strict=True)
+    stat = resolved.stat()
+    return {
+        "path": str(resolved),
+        "device": stat.st_dev,
+        "inode": stat.st_ino,
+        "size": stat.st_size,
+        "mtime_ns": stat.st_mtime_ns,
+    }
+
+
+def readonly_graph_status(repo: Path) -> dict[str, Any]:
+    database = repo / ".code-review-graph/graph.db"
+    connection = sqlite3.connect(
+        f"{database.resolve(strict=True).as_uri()}?mode=ro&immutable=1", uri=True
+    )
+    try:
+        metadata = {
+            str(key): str(value)
+            for key, value in connection.execute("SELECT key, value FROM metadata")
+        }
+        nodes = int(connection.execute("SELECT COUNT(*) FROM nodes").fetchone()[0])
+        edges = int(connection.execute("SELECT COUNT(*) FROM edges").fetchone()[0])
+        files = int(
+            connection.execute(
+                "SELECT COUNT(*) FROM nodes WHERE kind = 'File'"
+            ).fetchone()[0]
+        )
+        languages = [
+            str(row[0])
+            for row in connection.execute(
+                "SELECT DISTINCT language FROM nodes "
+                "WHERE language IS NOT NULL AND language != '' ORDER BY language"
+            )
+        ]
+    finally:
+        connection.close()
+    return {
+        "nodes": nodes,
+        "edges": edges,
+        "files": files,
+        "languages": languages,
+        "last_updated": metadata.get("last_updated"),
+        "built_on_branch": metadata.get("git_branch"),
+        "built_at_commit": metadata.get("git_head_sha"),
+        "current_branch": worktree_identity(repo)["branch"],
+        "current_sha": git_value(repo, "rev-parse", "HEAD"),
+        "vcs": "git",
+    }
+
+
+def nul_paths(output: bytes) -> list[str]:
+    return sorted(
+        {
+            item.decode("utf-8", errors="surrogateescape")
+            for item in output.split(b"\0")
+            if item
+        }
+    )
+
+
+def git_paths(repo: Path, arguments: list[str]) -> list[str]:
+    result = subprocess.run(
+        ["git", "-C", str(repo), *arguments],
+        capture_output=True,
+        timeout=60,
+        check=False,
+        stdin=subprocess.DEVNULL,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.decode("utf-8", errors="replace").strip()
+        raise LifecycleError(f"git path discovery failed: {detail}")
+    return nul_paths(result.stdout)
+
+
+def workspace_snapshot(repo: Path) -> dict[str, Any]:
+    status_result = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo),
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=no",
+        ],
+        capture_output=True,
+        timeout=60,
+        check=False,
+        stdin=subprocess.DEVNULL,
+    )
+    if status_result.returncode != 0:
+        raise LifecycleError("unable to read Git worktree status")
+
+    tracked = git_paths(repo, ["diff", "--name-only", "-z", "HEAD", "--"])
+    untracked = git_paths(repo, ["ls-files", "--others", "--exclude-standard", "-z"])
+    parseable_untracked = graph_parseable_untracked(repo, untracked)
+    all_paths = tracked
+    head = git_value(repo, "rev-parse", "HEAD")
+    digest = hashlib.sha256()
+    digest.update(head.encode("ascii"))
+    digest.update(status_result.stdout)
+    for relative in all_paths:
+        digest.update(relative.encode("utf-8", errors="surrogateescape"))
+        absolute = repo / relative
+        if absolute.is_file() and not absolute.is_symlink():
+            try:
+                digest.update(hashlib.sha256(absolute.read_bytes()).digest())
+            except (OSError, PermissionError):
+                digest.update(b"<unreadable>")
+        else:
+            digest.update(b"<missing-or-nonfile>")
+    return {
+        "head": head,
+        "fingerprint": digest.hexdigest(),
+        "tracked_files": tracked,
+        "untracked_files": untracked,
+        "parseable_untracked_files": parseable_untracked,
+        "dirty_files": all_paths,
+    }
+
+
+def graph_parseable_untracked(repo: Path, paths: list[str]) -> list[str]:
+    if not paths:
+        return []
+    script = r"""
+import json
+from pathlib import Path
+import sys
+from code_review_graph.incremental import _is_binary, _load_ignore_patterns, _should_ignore
+from code_review_graph.parser import CodeParser
+
+root = Path(sys.argv[1])
+paths = json.loads(sys.argv[2])
+patterns = _load_ignore_patterns(root)
+parser = CodeParser(root)
+result = []
+for relative in paths:
+    if _should_ignore(relative, patterns):
+        continue
+    absolute = root / relative
+    if not absolute.is_file() or absolute.is_symlink():
+        continue
+    if parser.detect_language(absolute) is None or _is_binary(absolute):
+        continue
+    result.append(relative)
+print(json.dumps(sorted(result)))
+"""
+    output = run(
+        [str(CRG_PYTHON), "-c", script, str(repo), json.dumps(paths)],
+        timeout=60,
+    ).stdout
+    try:
+        result = json.loads(output)
+    except json.JSONDecodeError as error:
+        raise LifecycleError("unable to classify untracked graph sources") from error
+    return [str(path) for path in result]
+
+
+def changed_since(repo: Path, base: str) -> list[str]:
+    return git_paths(repo, ["diff", "--name-only", "-z", base, "--"])
+
+
+def is_ancestor(repo: Path, older: str, newer: str) -> bool:
+    return (
+        run(
+            ["git", "-C", str(repo), "merge-base", "--is-ancestor", older, newer],
+            check=False,
+        ).returncode
+        == 0
+    )
+
+
+def graph_directory_bytes(repo: Path) -> int:
+    total = 0
+    for directory_name in (
+        ".code-review-graph",
+        ".code-review-graph.next",
+        ".code-review-graph.previous",
+    ):
+        data_dir = repo / directory_name
+        if not data_dir.is_dir():
+            continue
+        for root, _, files in os.walk(data_dir):
+            for name in files:
+                try:
+                    total += (Path(root) / name).stat().st_size
+                except FileNotFoundError:
+                    continue
+    return total
+
+
+def total_managed_graph_bytes(state: dict[str, Any]) -> int:
+    return sum(graph_directory_bytes(Path(path)) for path in state["worktrees"])
+
+
+def decide_action(
+    repo: Path,
+    entry: dict[str, Any],
+    snapshot: dict[str, Any],
+) -> tuple[str, str, str | None, dict[str, Any] | None]:
+    database = repo / ".code-review-graph/graph.db"
+    wal = repo / ".code-review-graph/graph.db-wal"
+    if not database.exists():
+        return "build", "graph is missing", None, None
+
+    wal_bytes = wal.stat().st_size if wal.exists() else 0
+    if wal_bytes > 0:
+        return "blocked", "graph WAL is nonzero; inspect before recovery", None, None
+
+    current_ignore_hash = ignore_hash(repo)
+    current_version = crg_version()
+    current_schema = graph_schema_version(database)
+    cached_status = {
+        "nodes": int(entry.get("nodes") or 0),
+        "edges": int(entry.get("edges") or 0),
+        "files": int(entry.get("files") or 0),
+        "languages": list(entry.get("languages") or []),
+        "last_updated": entry.get("last_updated"),
+        "last_build_type": entry.get("last_action", "indexed"),
+        "built_at_commit": entry.get("built_commit"),
+        "built_on_branch": entry.get("built_branch"),
+    }
+    if (
+        entry.get("state") == "healthy"
+        and entry.get("ignore_hash") == current_ignore_hash
+        and entry.get("crg_version") == current_version
+        and entry.get("schema_version") == current_schema
+        and entry.get("fingerprint_version") == 2
+        and entry.get("indexed_fingerprint") == snapshot["fingerprint"]
+        and entry.get("built_commit") == snapshot["head"]
+        and entry.get("graph_artifact") == graph_artifact_identity(database)
+        and cached_status["nodes"] > 0
+        and cached_status["files"] > 0
+    ):
+        return (
+            "noop",
+            "graph already represents the current worktree state",
+            None,
+            cached_status,
+        )
+
+    status = readonly_graph_status(repo)
+    if int(status.get("nodes") or 0) <= 0 or int(status.get("files") or 0) <= 0:
+        return "rebuild", "graph has no usable nodes or files", None, status
+
+    if entry.get("ignore_hash") != current_ignore_hash:
+        return (
+            "rebuild",
+            "ignore policy changed or lacks lifecycle provenance",
+            None,
+            status,
+        )
+    if entry.get("crg_version") != current_version:
+        return (
+            "rebuild",
+            "CRG version changed or lacks lifecycle provenance",
+            None,
+            status,
+        )
+    if entry.get("schema_version") != current_schema:
+        return (
+            "rebuild",
+            "graph schema changed or lacks lifecycle provenance",
+            None,
+            status,
+        )
+
+    indexed_fingerprint = entry.get("indexed_fingerprint")
+    if entry.get("fingerprint_version") != 2:
+        built_commit = str(status.get("built_at_commit") or "")
+        head = snapshot["head"]
+        if built_commit == head and not snapshot["tracked_files"]:
+            return "noop", "adopt tracked-source fingerprint policy", None, status
+    if indexed_fingerprint == snapshot["fingerprint"]:
+        if status.get("built_at_commit") != snapshot["head"]:
+            return (
+                "rebuild",
+                "graph commit provenance does not match current HEAD",
+                None,
+                status,
+            )
+        return (
+            "noop",
+            "graph already represents the current worktree state",
+            None,
+            status,
+        )
+
+    fragmentation = graph_fragmentation(database)
+    if float(fragmentation["ratio"]) > MAX_FRAGMENTATION_RATIO:
+        return (
+            "rebuild",
+            "SQLite free-page ratio exceeds the lifecycle limit",
+            None,
+            status,
+        )
+    if database.stat().st_size > DB_LIMIT_BYTES:
+        return (
+            "rebuild",
+            "graph database exceeds the incremental-update limit",
+            None,
+            status,
+        )
+
+    previous_dirty = (
+        set(entry.get("indexed_dirty_files") or [])
+        if entry.get("fingerprint_version") == 2
+        else set()
+    )
+    current_dirty = set(snapshot["dirty_files"])
+
+    built_commit = str(status.get("built_at_commit") or "")
+    head = git_value(repo, "rev-parse", "HEAD")
+    if not built_commit:
+        return "rebuild", "graph has no commit provenance", None, status
+    if built_commit != head and not is_ancestor(repo, built_commit, head):
+        return (
+            "rebuild",
+            "indexed commit is not an ancestor of current HEAD",
+            None,
+            status,
+        )
+
+    base = built_commit if built_commit != head else "HEAD"
+    committed_changed = set(changed_since(repo, base))
+    missing_previous = previous_dirty - current_dirty - committed_changed
+    if missing_previous:
+        return (
+            "rebuild",
+            "previously indexed dirty files were reverted or removed",
+            None,
+            status,
+        )
+    changed = sorted(committed_changed | current_dirty)
+    if not changed:
+        return (
+            "rebuild",
+            "worktree fingerprint changed without a safe incremental diff",
+            None,
+            status,
+        )
+
+    indexed_files = max(int(status.get("files") or 0), 1)
+    ratio = len(changed) / indexed_files
+    if len(changed) > MAX_CHANGED_FILES or ratio > MAX_CHANGED_RATIO:
+        return (
+            "rebuild",
+            f"change set is too large for incremental update ({len(changed)} files, {ratio:.1%})",
+            None,
+            status,
+        )
+    return "refresh", f"safe incremental update for {len(changed)} files", base, status
+
+
+def lifecycle_metadata(
+    repo: Path,
+    snapshot: dict[str, Any],
+    status: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    identity = worktree_identity(repo)
+    database = repo / ".code-review-graph/graph.db"
+    if status is None:
+        status = readonly_graph_status(repo)
+    fragmentation = graph_fragmentation(database)
+    return {
+        **identity,
+        "state": "healthy",
+        "last_error": None,
+        "last_seen_at": now_iso(),
+        "last_success_at": now_iso(),
+        "last_action": status.get("last_build_type", "indexed"),
+        "built_commit": status.get("built_at_commit"),
+        "built_branch": status.get("built_on_branch"),
+        "ignore_hash": ignore_hash(repo),
+        "crg_version": crg_version(),
+        "schema_version": graph_schema_version(database),
+        "graph_artifact": graph_artifact_identity(database),
+        "indexed_fingerprint": snapshot["fingerprint"],
+        "fingerprint_version": 2,
+        "indexed_dirty_files": snapshot["dirty_files"],
+        "nodes": int(status.get("nodes") or 0),
+        "edges": int(status.get("edges") or 0),
+        "files": int(status.get("files") or 0),
+        "languages": list(status.get("languages") or []),
+        "last_updated": status.get("last_updated"),
+        "db_bytes": database.stat().st_size,
+        "fragmentation": fragmentation,
+    }
+
+
+def process_live_worktree(
+    repo: Path,
+    entry: dict[str, Any],
+    event: dict[str, Any] | None,
+    *,
+    dry_run: bool,
+) -> tuple[bool, dict[str, Any]]:
+    if not dry_run:
+        ensure_worktree_lock(repo)
+    swap_artifacts = [
+        repo / ".code-review-graph.next",
+        repo / ".code-review-graph.previous",
+    ]
+    wal = repo / ".code-review-graph/graph.db-wal"
+    wal_requires_recovery = wal.exists() and wal.stat().st_size > 0
+    if any(path.exists() for path in swap_artifacts) or wal_requires_recovery:
+        recovery_reasons = []
+        if any(path.exists() for path in swap_artifacts):
+            recovery_reasons.append("atomic swap artifacts")
+        if wal_requires_recovery:
+            recovery_reasons.append("nonzero WAL")
+        recovery_report = {
+            "at": now_iso(),
+            "repo": str(repo),
+            "action": "recover",
+            "reason": f"{', '.join(recovery_reasons)} require guarded recovery",
+            "event": event.get("reason") if event else "periodic-reconcile",
+            "base": None,
+        }
+        print(json.dumps(recovery_report, sort_keys=True), flush=True)
+        if dry_run:
+            return True, {**entry, "last_decision": recovery_report}
+        try:
+            run(
+                [str(SAFE_REFRESH), "recover", str(repo)],
+                timeout=COMMAND_TIMEOUT_SECONDS,
+            )
+        except (LifecycleError, subprocess.TimeoutExpired) as error:
+            return False, {
+                **entry,
+                **worktree_identity(repo),
+                "state": "failed",
+                "last_error": str(error),
+                "last_attempt_at": now_iso(),
+            }
+
+    snapshot = workspace_snapshot(repo)
+    action, reason, base, status = decide_action(repo, entry, snapshot)
+    event_reason = event.get("reason") if event else "periodic-reconcile"
+    if (
+        action == "build"
+        and not entry.get("last_success_at")
+        and not (event and event.get("provision_required"))
+    ):
+        report = {
+            "at": now_iso(),
+            "repo": str(repo),
+            "action": "defer",
+            "reason": "new worktree graph is provisioned only when an agent needs it",
+            "event": event_reason,
+            "base": None,
+        }
+        print(json.dumps(report, sort_keys=True), flush=True)
+        return True, {
+            **entry,
+            **worktree_identity(repo),
+            "state": "dormant",
+            "last_action": "defer",
+            "last_reason": report["reason"],
+            "last_seen_at": now_iso(),
+        }
+    current_state: dict[str, Any] | None = None
+
+    report = {
+        "at": now_iso(),
+        "repo": str(repo),
+        "action": action,
+        "reason": reason,
+        "event": event_reason,
+        "base": base,
+    }
+    repeated_periodic_blocker = (
+        action == "blocked"
+        and event is None
+        and entry.get("state") == "blocked"
+        and entry.get("last_error") == reason
+    )
+    if dry_run or not repeated_periodic_blocker:
+        print(json.dumps(report, sort_keys=True), flush=True)
+
+    if dry_run:
+        return True, {**entry, **worktree_identity(repo), "last_decision": report}
+    if action == "blocked":
+        return False, {
+            **entry,
+            **worktree_identity(repo),
+            "state": "blocked",
+            "last_error": reason,
+            "last_attempt_at": now_iso(),
+        }
+    if action == "noop":
+        metadata = {**entry, **lifecycle_metadata(repo, snapshot, status)}
+        metadata["last_action"] = "noop"
+        metadata["last_reason"] = reason
+        return True, metadata
+
+    if current_state is None:
+        current_state = read_state()
+    total_bytes = total_managed_graph_bytes(current_state)
+    current_graph_bytes = graph_directory_bytes(repo)
+    estimated_new_graph_bytes = DB_LIMIT_BYTES
+    if action == "refresh":
+        estimated_new_graph_bytes = max(
+            DB_LIMIT_BYTES - current_graph_bytes,
+            0,
+        )
+    if (
+        action in {"build", "refresh", "rebuild"}
+        and total_bytes + estimated_new_graph_bytes > TOTAL_GRAPH_LIMIT_BYTES
+    ):
+        return False, {
+            **entry,
+            **worktree_identity(repo),
+            "state": "blocked",
+            "last_error": "managed graph storage exceeds the global capacity limit",
+            "last_attempt_at": now_iso(),
+        }
+
+    command = [str(SAFE_REFRESH), action, str(repo)]
+    if action == "refresh" and base:
+        command.append(base)
+    try:
+        result = run(command, timeout=COMMAND_TIMEOUT_SECONDS, check=False)
+        if result.returncode == 75:
+            return False, {
+                **entry,
+                **worktree_identity(repo),
+                "state": "pending",
+                "last_error": "target worktree has active graph readers",
+                "last_attempt_at": now_iso(),
+            }
+        if result.returncode != 0:
+            detail = (
+                result.stderr.strip()
+                or result.stdout.strip()
+                or f"exit {result.returncode}"
+            )
+            raise LifecycleError(f"{' '.join(command)} failed: {detail}")
+        refreshed_snapshot = workspace_snapshot(repo)
+        if refreshed_snapshot["fingerprint"] != snapshot["fingerprint"]:
+            return False, {
+                **entry,
+                **worktree_identity(repo),
+                "state": "pending",
+                "last_error": "worktree changed during graph write; retry required",
+                "last_attempt_at": now_iso(),
+            }
+        refreshed_status = readonly_graph_status(repo)
+        if refreshed_status.get("built_at_commit") != refreshed_snapshot["head"]:
+            return False, {
+                **entry,
+                **worktree_identity(repo),
+                "state": "failed",
+                "last_error": (
+                    "graph commit provenance does not match current HEAD "
+                    "after a successful graph write"
+                ),
+                "last_attempt_at": now_iso(),
+                "last_status": refreshed_status,
+            }
+        metadata = {
+            **entry,
+            **lifecycle_metadata(repo, refreshed_snapshot, refreshed_status),
+        }
+        metadata["last_action"] = action
+        metadata["last_reason"] = reason
+        return True, metadata
+    except (LifecycleError, subprocess.TimeoutExpired) as error:
+        return False, {
+            **entry,
+            **worktree_identity(repo),
+            "state": "failed",
+            "last_error": str(error),
+            "last_attempt_at": now_iso(),
+            "last_status": status,
+        }
+
+
+def queue_event_is_due(event: dict[str, Any]) -> bool:
+    next_attempt = parse_iso(event.get("next_attempt_at"))
+    now = dt.datetime.now(dt.timezone.utc)  # noqa: UP017
+    if next_attempt is not None and next_attempt > now:
+        return False
+    lease_expiry = parse_iso(event.get("lease_expires_at"))
+    return lease_expiry is None or lease_expiry <= now
+
+
+def claim_queue_event(event: dict[str, Any]) -> dict[str, Any] | None:
+    """Lease one exact generation so a stale process cannot acknowledge it."""
+    ensure_control_db()
+    connection = control_connection(write=True)
+    try:
+        row = connection.execute(
+            "SELECT * FROM work_items WHERE repo=?", (event["repo"],)
+        ).fetchone()
+        if row is None:
+            connection.commit()
+            return None
+        current = row_to_event(row)
+        if (
+            current["id"] != event["id"]
+            or current["generation"] != event["generation"]
+            or not queue_event_is_due(current)
+        ):
+            connection.commit()
+            return None
+        lease_id = str(uuid.uuid4())
+        lease_expiry = dt.datetime.now(dt.timezone.utc) + dt.timedelta(  # noqa: UP017
+            seconds=COMMAND_TIMEOUT_SECONDS + 300
+        )
+        connection.execute(
+            """UPDATE work_items SET lease_id=?, lease_expires_at=?
+               WHERE repo=? AND generation=? AND event_id=?""",
+            (
+                lease_id, lease_expiry.isoformat(timespec="seconds"),
+                event["repo"], event["generation"], event["id"],
+            ),
+        )
+        connection.commit()
+        return {
+            **current,
+            "lease_id": lease_id,
+            "lease_expires_at": lease_expiry.isoformat(timespec="seconds"),
+        }
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def disk_work_allowed(*, dry_run: bool) -> bool:
+    """Apply a cheap 8/10 GiB hysteresis circuit before repo or DB work."""
+    free_bytes = available_bytes(USER_ROOT)
+    ensure_control_db()
+    connection = control_connection(write=not dry_run)
+    try:
+        row = connection.execute(
+            "SELECT value_json FROM system_state WHERE key='disk_circuit'"
+        ).fetchone()
+        circuit = json.loads(row[0]) if row else {}
+        if not isinstance(circuit, dict):
+            circuit = {}
+        was_open = bool(circuit.get("open"))
+        should_open = free_bytes < MIN_FREE_BYTES or (
+            was_open and free_bytes < RESUME_FREE_BYTES
+        )
+        if should_open:
+            if not was_open and not dry_run:
+                circuit = {
+                    "open": True,
+                    "opened_at": now_iso(),
+                    "free_bytes_at_open": free_bytes,
+                    "minimum_free_bytes": MIN_FREE_BYTES,
+                    "resume_free_bytes": RESUME_FREE_BYTES,
+                }
+                connection.execute(
+                    "INSERT OR REPLACE INTO system_state VALUES ('disk_circuit', ?, ?)",
+                    (json.dumps(circuit, sort_keys=True), now_iso()),
+                )
+                connection.commit()
+            print(
+                json.dumps(
+                    {
+                        "at": now_iso(),
+                        "action": "defer",
+                        "reason": "disk-pressure circuit is open",
+                        "free_bytes": free_bytes,
+                        "resume_free_bytes": RESUME_FREE_BYTES,
+                    },
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
+            if not dry_run and connection.in_transaction:
+                connection.commit()
+            return False
+        if was_open and not dry_run:
+            circuit = {
+                **circuit,
+                "open": False,
+                "closed_at": now_iso(),
+                "free_bytes_at_close": free_bytes,
+                "minimum_free_bytes": MIN_FREE_BYTES,
+                "resume_free_bytes": RESUME_FREE_BYTES,
+            }
+            connection.execute(
+                "INSERT OR REPLACE INTO system_state VALUES ('disk_circuit', ?, ?)",
+                (json.dumps(circuit, sort_keys=True), now_iso()),
+            )
+            connection.commit()
+            print(
+                json.dumps(
+                    {
+                        "at": now_iso(),
+                        "action": "resume",
+                        "reason": "disk-pressure circuit closed",
+                        "free_bytes": free_bytes,
+                    },
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
+        elif (
+            circuit
+            and not dry_run
+            and (
+                circuit.get("minimum_free_bytes") != MIN_FREE_BYTES
+                or circuit.get("resume_free_bytes") != RESUME_FREE_BYTES
+            )
+        ):
+            circuit = {
+                **circuit,
+                "minimum_free_bytes": MIN_FREE_BYTES,
+                "resume_free_bytes": RESUME_FREE_BYTES,
+            }
+            connection.execute(
+                "INSERT OR REPLACE INTO system_state VALUES ('disk_circuit', ?, ?)",
+                (json.dumps(circuit, sort_keys=True), now_iso()),
+            )
+            connection.commit()
+        elif not dry_run:
+            connection.commit()
+        return True
+    except Exception:
+        if connection.in_transaction:
+            connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def retry_event(event: dict[str, Any]) -> dict[str, Any]:
+    attempts = int(event.get("attempts", 0)) + 1
+    exponent = min(attempts - 1, 20)
+    delay = min(BACKOFF_MAX_SECONDS, BACKOFF_BASE_SECONDS * (2**exponent))
+    seed = hashlib.sha256(
+        f"{event.get('repo')}:{event.get('generation')}".encode("utf-8")
+    ).digest()[0]
+    delay = max(1, int(delay * (0.9 + (seed / 2550))))
+    next_attempt = dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=delay)  # noqa: UP017
+    return {
+        **event,
+        "attempts": attempts,
+        "last_attempt_at": now_iso(),
+        "next_attempt_at": next_attempt.isoformat(timespec="seconds"),
+        "lease_id": None,
+        "lease_expires_at": None,
+    }
+
+
+def commit_attempt(
+    repo: Path,
+    claimed_event: dict[str, Any],
+    updated_entry: dict[str, Any],
+    *,
+    success: bool,
+) -> None:
+    """Commit state and acknowledge only the exact claimed generation."""
+    ensure_control_db()
+    connection = control_connection(write=True)
+    try:
+        state_row = connection.execute(
+            "SELECT entry_json FROM worktrees WHERE repo=?", (str(repo),)
+        ).fetchone()
+        current_entry = json.loads(state_row["entry_json"]) if state_row else {}
+        updated_entry = {**updated_entry}
+        for key in ("lifecycle_id", "orca_instance_id"):
+            if current_entry.get(key):
+                updated_entry[key] = current_entry[key]
+        row = connection.execute(
+            "SELECT * FROM work_items WHERE repo=?", (str(repo),)
+        ).fetchone()
+        current = row_to_event(row) if row else None
+        if current is not None and (
+            current.get("generation") != claimed_event.get("generation")
+            or current.get("id") != claimed_event.get("id")
+        ):
+            pending_entry = {
+                **updated_entry,
+                "state": "pending",
+                "last_event": current.get("reason"),
+                "last_seen_at": now_iso(),
+            }
+            connection.execute(
+                "UPDATE worktrees SET entry_json=?, updated_at=? WHERE repo=?",
+                (json.dumps(pending_entry, sort_keys=True), now_iso(), str(repo)),
+            )
+            connection.execute(
+                "INSERT INTO outcomes(repo, generation, event_id, status, detail_json, recorded_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    str(repo), claimed_event["generation"], claimed_event["id"],
+                    "superseded", json.dumps(updated_entry, sort_keys=True), now_iso(),
+                ),
+            )
+            connection.commit()
+            return
+        if current is None or current.get("lease_id") != claimed_event.get("lease_id"):
+            connection.commit()
+            return
+
+        terminal = success or updated_entry.get("state") in {"blocked", "orphaned"}
+        connection.execute(
+            "UPDATE worktrees SET entry_json=?, updated_at=? WHERE repo=?",
+            (json.dumps(updated_entry, sort_keys=True), now_iso(), str(repo)),
+        )
+        connection.execute(
+            "INSERT INTO outcomes(repo, generation, event_id, status, detail_json, recorded_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                str(repo), claimed_event["generation"], claimed_event["id"],
+                "success" if success else str(updated_entry.get("state", "failed")),
+                json.dumps(updated_entry, sort_keys=True), now_iso(),
+            ),
+        )
+        connection.execute(
+            """DELETE FROM outcomes
+               WHERE sequence <= COALESCE((SELECT MAX(sequence) FROM outcomes), 0) - ?""",
+            (OUTCOME_RETENTION,),
+        )
+        if terminal:
+            connection.execute(
+                """DELETE FROM work_items
+                   WHERE repo=? AND generation=? AND event_id=? AND lease_id=?""",
+                (
+                    str(repo), claimed_event["generation"], claimed_event["id"],
+                    claimed_event.get("lease_id"),
+                ),
+            )
+            connection.commit()
+            return
+        if current is not None:
+            retry = retry_event(current)
+            upsert_queue_event(connection, retry)
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def audit_managed_worktrees(state: dict[str, Any], *, dry_run: bool) -> None:
+    """Reconcile lifecycle membership independently of queued graph work."""
+    now = dt.datetime.now(dt.timezone.utc)  # noqa: UP017
+    for repo_path, entry in sorted(state["worktrees"].items()):
+        live = is_live_worktree(repo_path, entry)
+        if live:
+            if entry.get("state") != "orphaned":
+                continue
+            restored = {
+                **entry,
+                "state": entry.get("state_before_orphan") or "dormant",
+                "last_seen_at": now_iso(),
+            }
+            for key in (
+                "orphaned_at",
+                "missing_confirmations",
+                "state_before_orphan",
+                "last_error",
+            ):
+                restored.pop(key, None)
+            print(
+                json.dumps(
+                    {
+                        "at": now_iso(),
+                        "repo": repo_path,
+                        "action": "restore",
+                        "reason": "managed worktree is live again",
+                    },
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
+            if not dry_run:
+                update_state_entry(repo_path, restored)
+            continue
+
+        orphaned_at = parse_iso(entry.get("orphaned_at"))
+        confirmations = int(entry.get("missing_confirmations") or 0) + 1
+        grace_elapsed = (
+            orphaned_at is not None
+            and (now - orphaned_at).total_seconds() >= ORPHAN_GRACE_SECONDS
+        )
+        if confirmations >= ORPHAN_CONFIRMATIONS and grace_elapsed:
+            print(
+                json.dumps(
+                    {
+                        "at": now_iso(),
+                        "repo": repo_path,
+                        "action": "forget",
+                        "reason": "missing worktree passed orphan grace and confirmation",
+                    },
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
+            if not dry_run:
+                remove_state_and_queue(repo_path)
+            continue
+
+        updated = {
+            **entry,
+            "state_before_orphan": (
+                entry.get("state_before_orphan")
+                if entry.get("state") == "orphaned"
+                else entry.get("state")
+            ),
+            "state": "orphaned",
+            "orphaned_at": entry.get("orphaned_at") or now_iso(),
+            "missing_confirmations": confirmations,
+            "last_error": "managed worktree no longer exists",
+            "last_attempt_at": now_iso(),
+        }
+        if entry.get("state") != "orphaned":
+            print(
+                json.dumps(
+                    {
+                        "at": now_iso(),
+                        "repo": repo_path,
+                        "action": "orphan",
+                        "reason": "managed worktree no longer exists; grace started",
+                    },
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
+        if not dry_run:
+            update_state_entry(repo_path, updated)
+
+
+def sweep_stale_graphs(state: dict[str, Any], *, dry_run: bool, budget: int) -> None:
+    """Enqueue managed graphs with monotone, lifecycle-repairable drift.
+
+    Freshness is otherwise event-driven, so a ref advanced without a checkout, a
+    hook that never ran, or a coordinator paused by the disk circuit leaves a
+    healthy entry indexing a commit the worktree no longer has. An installed CRG
+    upgrade likewise invalidates a previously healthy graph until one rebuild
+    records the new version.
+
+    The predicates are deliberately narrower than `inspect`'s consumer verdict.
+    `inspect` also fails on dirty working files and on a graph that indexes to
+    zero nodes, and neither clears by rebuilding, so using it here would rebuild
+    on every edit during an active session and would loop forever on a repo with
+    no parseable source. Commit and installed-version drift both clear after one
+    successful refresh or rebuild. This only enqueues; the normal claim path
+    still owns every graph write.
+    """
+    try:
+        installed_version = crg_version()
+    except (LifecycleError, OSError, subprocess.SubprocessError):
+        installed_version = None
+    enqueued = 0
+    for repo_path, entry in sorted(state["worktrees"].items()):
+        if enqueued >= budget:
+            return
+        if entry.get("state") != "healthy" or not is_live_worktree(repo_path, entry):
+            continue
+        built_commit = str(entry.get("built_commit") or "")
+        if not built_commit:
+            continue
+        repo = Path(repo_path)
+        try:
+            if read_queue_event(repo) is not None:
+                continue
+            indexed_version = str(entry.get("crg_version") or "")
+            if installed_version and indexed_version and indexed_version != installed_version:
+                event_reason = VERSION_SWEEP_REASON
+                reason = (
+                    f"indexed CRG {indexed_version} differs from installed "
+                    f"{installed_version}"
+                )
+            else:
+                head = git_value(repo, "rev-parse", "HEAD")
+                if built_commit == head:
+                    continue
+                event_reason = STALE_SWEEP_REASON
+                reason = (
+                    f"indexed commit {built_commit[:12]} is behind HEAD {head[:12]}"
+                )
+            if not dry_run:
+                enqueue(repo_path, event_reason, kick=False)
+        except (
+            LifecycleError,
+            OSError,
+            sqlite3.Error,
+            subprocess.SubprocessError,
+        ) as error:
+            print(
+                json.dumps(
+                    {
+                        "at": now_iso(),
+                        "repo": repo_path,
+                        "action": "skip",
+                        "reason": f"stale-graph sweep could not read this worktree: {error}",
+                        "event": "lifecycle:drift-sweep",
+                        "base": None,
+                    },
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
+            continue
+        print(
+            json.dumps(
+                {
+                    "at": now_iso(),
+                    "repo": repo_path,
+                    "action": "enqueue",
+                    "reason": reason,
+                    "event": event_reason,
+                    "base": None,
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
+        enqueued += 1
+
+
+def reconcile(*, repo_filter: str | None, dry_run: bool) -> int:
+    try:
+        lock_context = file_lock(COORDINATOR_LOCK_PATH, blocking=False)
+        lock_context.__enter__()
+    except LifecycleError as error:
+        print(
+            json.dumps(
+                {"at": now_iso(), "action": "skip", "reason": str(error)},
+                sort_keys=True,
+            )
+        )
+        return 0
+
+    failures = 0
+    try:
+        if not disk_work_allowed(dry_run=dry_run):
+            return 0
+        state = read_state()
+        if not repo_filter:
+            audit_managed_worktrees(state, dry_run=dry_run)
+            if not dry_run:
+                state = read_state()
+            # Hook events are real user activity and claim the processing budget
+            # first; detection may only fill what they leave, so a drifted graph
+            # can never starve a genuine post-commit.
+            due_now = sum(
+                1
+                for path, event in queued_events().items()
+                if path in state["worktrees"] and queue_event_is_due(event)
+            )
+            sweep_stale_graphs(
+                state,
+                dry_run=dry_run,
+                budget=max(0, MAX_ITEMS_PER_RUN - due_now),
+            )
+            if not dry_run:
+                state = read_state()
+        event_snapshot = queued_events(quarantine_invalid=not dry_run)
+        if repo_filter:
+            try:
+                repo = canonical_live_worktree(repo_filter)
+            except (FileNotFoundError, LifecycleError):
+                managed_path = str(Path(repo_filter).expanduser().resolve(strict=False))
+                if managed_path not in state["worktrees"]:
+                    raise LifecycleError(
+                        f"path is neither a live nor managed worktree: {managed_path}"
+                    )
+                selected = [
+                    (
+                        managed_path,
+                        state["worktrees"][managed_path],
+                        event_snapshot.get(managed_path),
+                    )
+                ]
+            else:
+                if str(repo) not in state["worktrees"]:
+                    identity = worktree_identity(repo)
+                    state["worktrees"][str(repo)] = {
+                        **identity,
+                        "state": "pending",
+                        "last_seen_at": now_iso(),
+                    }
+                    if not dry_run:
+                        update_state_entry(str(repo), state["worktrees"][str(repo)])
+                selected = [
+                    (
+                        str(repo),
+                        state["worktrees"][str(repo)],
+                        event_snapshot.get(str(repo)),
+                    )
+                ]
+        else:
+            selected = [
+                (path, state["worktrees"][path], event)
+                for path, event in sorted(event_snapshot.items())
+                if path in state["worktrees"] and queue_event_is_due(event)
+            ][:MAX_ITEMS_PER_RUN]
+
+        for repo_path, entry, event in selected:
+            if event is None or not queue_event_is_due(event):
+                continue
+            if not dry_run:
+                event = claim_queue_event(event)
+                if event is None:
+                    continue
+            repo = Path(repo_path)
+            if not is_live_worktree(repo_path, entry):
+                updated_entry = {
+                    **entry,
+                    "state": "orphaned",
+                    "last_error": "managed worktree no longer exists",
+                    "last_attempt_at": now_iso(),
+                }
+                print(
+                    json.dumps(
+                        {
+                            "at": now_iso(),
+                            "repo": repo_path,
+                            "action": "orphan",
+                            "reason": "managed worktree no longer exists; graph retained",
+                        },
+                        sort_keys=True,
+                    ),
+                    flush=True,
+                )
+                if not dry_run:
+                    commit_attempt(repo, event, updated_entry, success=False)
+                continue
+            try:
+                success, updated_entry = process_live_worktree(
+                    repo,
+                    entry,
+                    event,
+                    dry_run=dry_run,
+                )
+            except (
+                LifecycleError,
+                OSError,
+                sqlite3.Error,
+                subprocess.SubprocessError,
+            ) as error:
+                success = False
+                updated_entry = {
+                    **entry,
+                    **worktree_identity(repo),
+                    "state": "failed",
+                    "last_error": str(error),
+                    "last_attempt_at": now_iso(),
+                }
+                print(
+                    json.dumps(
+                        {
+                            "at": now_iso(),
+                            "repo": repo_path,
+                            "action": "failed",
+                            "reason": str(error),
+                        },
+                        sort_keys=True,
+                    ),
+                    flush=True,
+                )
+            if not dry_run:
+                commit_attempt(repo, event, updated_entry, success=success)
+            if not success and updated_entry.get("state") not in {
+                "blocked",
+                "orphaned",
+            }:
+                failures += 1
+    finally:
+        lock_context.__exit__(None, None, None)
+    return 1 if failures else 0
+
+
+def inspect_under_lock(repo: Path) -> dict[str, Any]:
+    state = read_state_readonly()
+    entry = state["worktrees"].get(str(repo), {})
+    database = repo / ".code-review-graph/graph.db"
+    wal = repo / ".code-review-graph/graph.db-wal"
+    result: dict[str, Any] = {
+        "repo": str(repo),
+        "managed": bool(entry),
+        "usable": False,
+        "reason": "graph is not lifecycle-managed",
+    }
+    if not entry or not database.exists():
+        if entry:
+            if entry.get("state") == "dormant":
+                result["reason"] = "graph is dormant until an agent needs it"
+                result["next_action"] = (
+                    "enqueue this worktree with reason agent:graph-needed"
+                )
+            else:
+                result["reason"] = "graph database is missing"
+        return result
+    if entry.get("state") != "healthy":
+        result["reason"] = f"lifecycle state is {entry.get('state', 'unknown')}"
+        return result
+    expected_artifact = entry.get("graph_artifact")
+    if not isinstance(expected_artifact, dict):
+        result["reason"] = "validated graph artifact identity is unavailable"
+        return result
+    if expected_artifact != graph_artifact_identity(database):
+        result["reason"] = "graph artifact changed after lifecycle validation"
+        return result
+    identity = worktree_identity(repo)
+    if not stable_identity_matches(entry, identity):
+        result["reason"] = "worktree identity changed"
+        return result
+    if entry.get("ignore_hash") != ignore_hash(repo):
+        result["reason"] = "ignore policy changed after the last successful index"
+        return result
+    if entry.get("crg_version") != crg_version():
+        result["reason"] = "CRG version changed after the last successful index"
+        return result
+    try:
+        if entry.get("schema_version") != graph_schema_version(database):
+            result["reason"] = "graph schema changed after the last successful index"
+            return result
+    except (LifecycleError, OSError, sqlite3.Error) as error:
+        result["reason"] = f"graph validation failed: {error}"
+        return result
+    if wal.exists() and wal.stat().st_size > 0:
+        result["reason"] = "graph WAL is nonzero"
+        return result
+    snapshot = workspace_snapshot(repo)
+    if entry.get("fingerprint_version") != 2:
+        result["reason"] = "lifecycle fingerprint policy requires reconciliation"
+        return result
+    if entry.get("indexed_fingerprint") != snapshot["fingerprint"]:
+        result["reason"] = "worktree changed after the last successful index"
+        return result
+    if entry.get("built_commit") != identity.get("head"):
+        result["reason"] = "graph commit provenance does not match current HEAD"
+        return result
+    nodes = int(entry.get("nodes") or 0)
+    files = int(entry.get("files") or 0)
+    if nodes <= 0 or files <= 0:
+        result["reason"] = "graph has no usable nodes or files"
+        return result
+    status = {
+        "nodes": nodes,
+        "edges": int(entry.get("edges") or 0),
+        "files": files,
+        "languages": list(entry.get("languages") or []),
+        "last_updated": entry.get("last_updated"),
+        "built_on_branch": entry.get("built_branch"),
+        "built_at_commit": entry.get("built_commit"),
+        "current_branch": identity.get("branch"),
+        "current_sha": identity.get("head"),
+        "vcs": "git",
+    }
+    result.update(
+        {
+            "usable": True,
+            "reason": "graph matches the current worktree state",
+            "coverage": (
+                "partial" if snapshot["parseable_untracked_files"] else "full"
+            ),
+            "status": status,
+            "last_success_at": entry.get("last_success_at"),
+        }
+    )
+    if snapshot["parseable_untracked_files"]:
+        result["excluded_sources"] = snapshot["parseable_untracked_files"]
+    return result
+
+
+def inspect(repo_arg: str) -> dict[str, Any]:
+    repo = canonical_live_worktree(repo_arg)
+    try:
+        with worktree_read_lock(repo):
+            return inspect_under_lock(repo)
+    except LifecycleError as error:
+        return {
+            "repo": str(repo),
+            "managed": False,
+            "usable": False,
+            "reason": str(error),
+        }
+
+
+def managed_hook_content(reason: str) -> str:
+    return f"""#!/bin/sh
+# Managed by crg-lifecycle. This hook only enqueues; it never writes graph.db.
+CRG_LIFECYCLE="$HOME/.local/bin/crg-lifecycle"
+if test -x "$CRG_LIFECYCLE"
+then
+    repo_root=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
+    "$CRG_LIFECYCLE" enqueue "$repo_root" "git:{reason}" >/dev/null 2>&1 || true
+fi
+exit 0
+"""
+
+
+def install_hooks(repo_arg: str, *, dry_run: bool) -> int:
+    repo = canonical_live_worktree(repo_arg)
+    raw_hooks = git_value(repo, "rev-parse", "--git-path", "hooks")
+    hooks_dir = Path(raw_hooks)
+    if not hooks_dir.is_absolute():
+        hooks_dir = (repo / hooks_dir).resolve()
+    hooks_dir.mkdir(parents=True, exist_ok=True)
+
+    planned: list[tuple[Path, str]] = []
+    for hook_name in ("post-checkout", "post-commit", "post-merge", "post-rewrite"):
+        hook = hooks_dir / hook_name
+        content = managed_hook_content(hook_name)
+        if hook.exists():
+            existing = hook.read_text(encoding="utf-8", errors="replace")
+            if existing == content:
+                print(f"OK {hook}")
+                continue
+            print(f"REFUSE existing unmanaged hook: {hook}", file=sys.stderr)
+            return 1
+        planned.append((hook, content))
+
+    for hook, _ in planned:
+        print(f"INSTALL {hook}")
+    if dry_run:
+        return 0
+
+    created: list[Path] = []
+    try:
+        for hook, content in planned:
+            descriptor = os.open(hook, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o755)
+            try:
+                with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                    handle.write(content)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+            except Exception:
+                hook.unlink(missing_ok=True)
+                raise
+            created.append(hook)
+    except Exception as error:
+        for hook in created:
+            hook.unlink(missing_ok=True)
+        print(f"REFUSE hook installation race or write failure: {error}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def forget(repo_arg: str) -> None:
+    """Forget an exact managed path; live graph data remains protected."""
+    managed_path = Path(repo_arg).expanduser().resolve(strict=False)
+    if managed_path == USER_ROOT or USER_ROOT not in managed_path.parents:
+        raise LifecycleError(
+            f"repository is outside the expected user root: {managed_path}"
+        )
+    state = read_state_readonly()
+    if str(managed_path) not in state["worktrees"]:
+        raise LifecycleError(f"worktree is not lifecycle-managed: {managed_path}")
+    if managed_path.exists():
+        repo = canonical_live_worktree(managed_path)
+        graph_paths = [
+            repo / ".code-review-graph",
+            repo / ".code-review-graph.next",
+            repo / ".code-review-graph.previous",
+        ]
+        if any(path.exists() for path in graph_paths):
+            raise LifecycleError(
+                "refusing to forget a live repository that still has graph data"
+            )
+    with file_lock(COORDINATOR_LOCK_PATH, blocking=False):
+        remove_state_and_queue(str(managed_path))
+    print(
+        json.dumps({"action": "forget", "repo": str(managed_path)}, sort_keys=True)
+    )
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    enqueue_parser = subparsers.add_parser("enqueue")
+    enqueue_parser.add_argument("repo")
+    enqueue_parser.add_argument("reason")
+    enqueue_parser.add_argument("--no-kick", action="store_true")
+
+    register_parser = subparsers.add_parser("register")
+    register_parser.add_argument("repo")
+    register_parser.add_argument("--orca-instance-id")
+
+    attach_parser = subparsers.add_parser("attach")
+    attach_parser.add_argument("repo")
+    attach_parser.add_argument("--orca-instance-id")
+
+    reconcile_parser = subparsers.add_parser("reconcile")
+    reconcile_parser.add_argument("--repo")
+    reconcile_parser.add_argument("--dry-run", action="store_true")
+
+    inspect_parser = subparsers.add_parser("inspect")
+    inspect_parser.add_argument("repo")
+    inspect_parser.add_argument("--json", action="store_true")
+
+    hooks_parser = subparsers.add_parser("install-hooks")
+    hooks_parser.add_argument("repo")
+    hooks_parser.add_argument("--dry-run", action="store_true")
+
+    forget_parser = subparsers.add_parser("forget")
+    forget_parser.add_argument("repo")
+    return parser
+
+
+def main() -> int:
+    parser = build_parser()
+    arguments = parser.parse_args()
+    try:
+        if arguments.command == "enqueue":
+            event = enqueue(
+                arguments.repo, arguments.reason, kick=not arguments.no_kick
+            )
+            print(json.dumps(event, sort_keys=True))
+            return 0
+        if arguments.command in {"attach", "register"}:
+            entry = attach(
+                arguments.repo,
+                orca_instance_id=arguments.orca_instance_id,
+            )
+            print(json.dumps(entry, sort_keys=True))
+            return 0
+        if arguments.command == "reconcile":
+            return reconcile(repo_filter=arguments.repo, dry_run=arguments.dry_run)
+        if arguments.command == "inspect":
+            result = inspect(arguments.repo)
+            if arguments.json:
+                print(json.dumps(result, indent=2, sort_keys=True))
+            else:
+                print(f"usable={str(result['usable']).lower()}")
+                print(f"reason={result['reason']}")
+            return 0 if result["usable"] else 1
+        if arguments.command == "install-hooks":
+            return install_hooks(arguments.repo, dry_run=arguments.dry_run)
+        if arguments.command == "forget":
+            forget(arguments.repo)
+            return 0
+    except (
+        LifecycleError,
+        FileNotFoundError,
+        OSError,
+        sqlite3.Error,
+        subprocess.TimeoutExpired,
+    ) as error:
+        print(f"crg-lifecycle: {error}", file=sys.stderr)
+        return 1
+    parser.error("unsupported command")
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

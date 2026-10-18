@@ -1,0 +1,4 @@
+interface:
+  display_name: "Housekeeping"
+  short_description: "Audit and tidy Codex agent artifacts safely"
+  default_prompt: "Use $housekeeping to scan agent artifacts for the current repository and propose safe cleanup actions."

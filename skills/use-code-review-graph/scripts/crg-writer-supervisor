@@ -1,0 +1,109 @@
+#!/usr/bin/env python3
+"""Serialize CRG writers and isolate readers to the target worktree."""
+
+from __future__ import annotations
+
+import fcntl
+import hashlib
+import os
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+SAFE_REFRESH = (Path.home() / '.local/bin/crg-safe-refresh')
+GLOBAL_WRITER_LOCK = (Path.home() / '.code-review-graph/writer.flock')
+WORKTREE_LOCK_DIR = (Path.home() / '.code-review-graph/locks')
+TARGET_LOCK_WAIT_SECONDS = 10.0
+TEMPORARY_CONTENTION_EXIT = 75
+
+
+def worktree_lock_path(repo_root: Path | str) -> Path:
+    canonical_root = Path(repo_root).expanduser().resolve(strict=True)
+    digest = hashlib.sha256(str(canonical_root).encode("utf-8")).hexdigest()
+    return WORKTREE_LOCK_DIR / f"{digest}.flock"
+
+
+def main() -> int:
+    if len(sys.argv) < 4 or Path(sys.argv[1]).resolve() != SAFE_REFRESH.resolve():
+        print("crg-writer-supervisor only runs crg-safe-refresh", file=sys.stderr)
+        return 2
+    if not GLOBAL_WRITER_LOCK.is_file() or GLOBAL_WRITER_LOCK.is_symlink():
+        print("crg-writer-supervisor: unsafe writer lock file", file=sys.stderr)
+        return 1
+    repo_root = Path(sys.argv[3])
+    if not repo_root.is_absolute():
+        print("crg-writer-supervisor: repository path must be absolute", file=sys.stderr)
+        return 1
+    try:
+        repo_root = repo_root.resolve(strict=True)
+    except FileNotFoundError:
+        print("crg-writer-supervisor: repository path is unavailable", file=sys.stderr)
+        return 1
+    target_lock_path = worktree_lock_path(repo_root)
+    if not target_lock_path.is_file() or target_lock_path.is_symlink():
+        print("crg-writer-supervisor: worktree lock is unavailable", file=sys.stderr)
+        return 1
+
+    global_lock = GLOBAL_WRITER_LOCK.open("r+")
+    try:
+        fcntl.flock(global_lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        global_lock.close()
+        print("crg-writer-supervisor: another CRG writer is active", file=sys.stderr)
+        return 1
+    target_lock = target_lock_path.open("r+")
+    try:
+        deadline = time.monotonic() + TARGET_LOCK_WAIT_SECONDS
+        while True:
+            try:
+                fcntl.flock(target_lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    print(
+                        "crg-writer-supervisor: target worktree has active readers",
+                        file=sys.stderr,
+                    )
+                    return TEMPORARY_CONTENTION_EXIT
+                time.sleep(0.05)
+
+        environment = os.environ.copy()
+        environment["CRG_WRITER_SUPERVISED"] = "1"
+        command = [*sys.argv[1:]]
+        command[2] = str(repo_root)
+        process = subprocess.Popen(
+            command,
+            env=environment,
+            start_new_session=True,
+            pass_fds=(global_lock.fileno(), target_lock.fileno()),
+        )
+
+        def terminate(signum: int, _frame: object) -> None:
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                return
+            deadline = time.monotonic() + 5
+            while process.poll() is None and time.monotonic() < deadline:
+                time.sleep(0.05)
+            if process.poll() is None:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            raise SystemExit(128 + signum)
+
+        signal.signal(signal.SIGTERM, terminate)
+        signal.signal(signal.SIGINT, terminate)
+        return process.wait()
+    finally:
+        fcntl.flock(target_lock.fileno(), fcntl.LOCK_UN)
+        target_lock.close()
+        fcntl.flock(global_lock.fileno(), fcntl.LOCK_UN)
+        global_lock.close()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

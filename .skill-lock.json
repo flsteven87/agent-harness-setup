@@ -1,0 +1,104 @@
+{
+  "version": 3,
+  "skills": {
+    "computer-use": {
+      "source": "stablyai/orca",
+      "sourceType": "github",
+      "sourceUrl": "https://github.com/stablyai/orca.git",
+      "skillPath": "skills/computer-use/SKILL.md",
+      "skillFolderHash": "b59f27370a41225c22127e91da0c91cd2519f217",
+      "installedAt": "2026-07-30T11:21:02.213Z",
+      "updatedAt": "2026-10-14T09:19:54.134Z"
+    },
+    "vercel-react-best-practices": {
+      "source": "vercel-labs/agent-skills",
+      "sourceType": "github",
+      "sourceUrl": "https://github.com/vercel-labs/agent-skills.git",
+      "skillPath": "skills/react-best-practices/SKILL.md",
+      "skillFolderHash": "343db72180d05814949fef7d46be96b5c6ee86b3",
+      "installedAt": "2026-08-10T11:20:30.992Z",
+      "updatedAt": "2026-10-14T09:20:42.229Z"
+    },
+    "impeccable": {
+      "source": "pbakaus/impeccable",
+      "sourceType": "github",
+      "sourceUrl": "https://github.com/pbakaus/impeccable.git",
+      "skillPath": ".agents/skills/impeccable/SKILL.md",
+      "skillFolderHash": "2c733e8ccf7cdcc35b698ea4a0b5ab95ed72963d",
+      "installedAt": "2026-08-21T03:28:31.275Z",
+      "updatedAt": "2026-10-18T08:43:50.985Z"
+    },
+    "orca-cli": {
+      "source": "stablyai/orca",
+      "sourceType": "github",
+      "sourceUrl": "https://github.com/stablyai/orca.git",
+      "skillPath": "skills/orca-cli/SKILL.md",
+      "skillFolderHash": "572f7952ac451a30a9c2451b472a639b125ee584",
+      "installedAt": "2026-09-03T07:03:15.736Z",
+      "updatedAt": "2026-10-14T09:20:12.334Z"
+    },
+    "orchestration": {
+      "source": "stablyai/orca",
+      "sourceType": "github",
+      "sourceUrl": "https://github.com/stablyai/orca.git",
+      "skillPath": "skills/orchestration/SKILL.md",
+      "skillFolderHash": "b0cd1d58b0c317cf7c3726fef7e6b1197c405246",
+      "installedAt": "2026-09-03T07:03:15.742Z",
+      "updatedAt": "2026-10-14T09:20:31.670Z"
+    },
+    "ai-seo": {
+      "source": "coreyhaines31/marketingskills",
+      "sourceType": "github",
+      "sourceUrl": "https://github.com/coreyhaines31/marketingskills.git",
+      "skillPath": "skills/ai-seo/SKILL.md",
+      "skillFolderHash": "9acb1d78632c69acd5511eaf8fb12a48e7acea6b",
+      "installedAt": "2026-09-06T03:36:26.715Z",
+      "updatedAt": "2026-10-18T08:43:53.719Z"
+    },
+    "seo-audit": {
+      "source": "coreyhaines31/marketingskills",
+      "sourceType": "github",
+      "sourceUrl": "https://github.com/coreyhaines31/marketingskills.git",
+      "skillPath": "skills/seo-audit/SKILL.md",
+      "skillFolderHash": "882cc96732fa55143b6edc4751aff297f976c145",
+      "installedAt": "2026-09-06T03:36:26.717Z",
+      "updatedAt": "2026-10-14T09:20:59.684Z"
+    },
+    "refero-design": {
+      "source": "referodesign/refero_skill",
+      "sourceType": "github",
+      "sourceUrl": "https://github.com/referodesign/refero_skill.git",
+      "skillPath": "skills/refero-design/SKILL.md",
+      "skillFolderHash": "4c2d358faf71cae46b3d084c4915f2ae0ebad379",
+      "installedAt": "2026-10-03T04:15:21.553Z",
+      "updatedAt": "2026-10-03T04:15:45.798Z"
+    },
+    "design-taste-frontend": {
+      "source": "Leonxlnx/taste-skill",
+      "sourceType": "github",
+      "sourceUrl": "https://github.com/Leonxlnx/taste-skill.git",
+      "skillPath": "skills/taste-skill/SKILL.md",
+      "skillFolderHash": "d11cb9568d2f27401ce1f48217721e69ee32637f",
+      "installedAt": "2026-10-17T15:42:29.212Z",
+      "updatedAt": "2026-10-17T15:42:29.212Z"
+    }
+  },
+  "dismissed": {
+    "findSkillsPrompt": true
+  },
+  "lastSelectedAgents": [
+    "amp",
+    "antigravity",
+    "antigravity-cli",
+    "cline",
+    "codex",
+    "cursor",
+    "deepagents",
+    "gemini-cli",
+    "github-copilot",
+    "kimi-code-cli",
+    "opencode",
+    "warp",
+    "zed"
+  ]
+}

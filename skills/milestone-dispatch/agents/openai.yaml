@@ -1,0 +1,4 @@
+interface:
+  display_name: "Milestone Dispatch"
+  short_description: "Hand off milestones with complete delivery ownership"
+  default_prompt: "Use $milestone-dispatch to hand off ready milestones to independent worktree agents. Each receiver owns verification, PR merge, ticket updates, exact task cleanup, and synchronization of local main; finish dispatch after verified prompt delivery."

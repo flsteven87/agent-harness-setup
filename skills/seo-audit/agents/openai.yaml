@@ -1,0 +1,5 @@
+interface:
+  display_name: "SEO Audit"
+  short_description: "Technical and on-page SEO audit"
+policy:
+  allow_implicit_invocation: false

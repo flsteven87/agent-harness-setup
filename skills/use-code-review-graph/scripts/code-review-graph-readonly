@@ -1,0 +1,371 @@
+#!/bin/sh
+""":"
+exec "${HOME}/.local/share/uv/tools/code-review-graph/bin/python" "$0" "$@"
+":"""
+# Launch the CRG MCP server as a strictly read-only graph consumer.
+#
+# The lifecycle coordinator is the sole control-plane authority. Every store holds
+# the target worktree's shared lifecycle lock while asking that coordinator for
+# the live usability verdict and opening the immutable database. Writers hold the
+# exclusive form of the same target lock.
+
+from __future__ import annotations
+
+import fcntl
+import hashlib
+import importlib.machinery
+import importlib.util
+import os
+import sqlite3
+import sys
+import threading
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+
+TEST_MODE = os.environ.get("CRG_TEST_MODE") == "1"
+WORKTREE_LOCK_DIR = Path(
+    os.environ.get("CRG_WORKTREE_LOCK_DIR", str(Path.home() / '.code-review-graph/locks'))
+    if TEST_MODE
+    else str(Path.home() / '.code-review-graph/locks')
+)
+LIFECYCLE = Path(
+    os.environ.get("CRG_LIFECYCLE_BIN", str(Path.home() / '.local/bin/crg-lifecycle'))
+    if TEST_MODE
+    else str(Path.home() / '.local/bin/crg-lifecycle')
+)
+_LIFECYCLE_MODULE: object | None = None
+READONLY_TOOLS = (
+    "get_minimal_context_tool",
+    "query_graph_tool",
+    "get_impact_radius_tool",
+    "get_review_context_tool",
+    "detect_changes_tool",
+    "get_architecture_overview_tool",
+    "list_graph_stats_tool",
+)
+
+
+def worktree_lock_path(repo_root: Path | str) -> Path:
+    canonical_root = Path(repo_root).expanduser().resolve(strict=True)
+    digest = hashlib.sha256(str(canonical_root).encode("utf-8")).hexdigest()
+    return WORKTREE_LOCK_DIR / f"{digest}.flock"
+
+
+def open_worktree_reader_lock(repo_root: Path):
+    lock_path = worktree_lock_path(repo_root)
+    if not lock_path.is_file() or lock_path.is_symlink():
+        raise sqlite3.OperationalError("CRG worktree lifecycle lock is unavailable")
+    reader_lock = lock_path.open("r")
+    try:
+        fcntl.flock(reader_lock.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB)
+    except BlockingIOError as error:
+        reader_lock.close()
+        raise sqlite3.OperationalError(
+            "CRG worktree refresh is in progress"
+        ) from error
+    return reader_lock
+
+
+def load_lifecycle() -> object:
+    """Load the single lifecycle validator used by CLI and MCP consumers."""
+    global _LIFECYCLE_MODULE
+    if _LIFECYCLE_MODULE is None:
+        loader = importlib.machinery.SourceFileLoader("crg_lifecycle_runtime", str(LIFECYCLE))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        if spec is None:
+            raise RuntimeError("unable to load CRG lifecycle validator")
+        module = importlib.util.module_from_spec(spec)
+        loader.exec_module(module)
+        _LIFECYCLE_MODULE = module
+    return _LIFECYCLE_MODULE
+
+
+def readonly_database(repo_root: Path, *, lock_held: bool = False) -> Path:
+    """Resolve and validate an existing exact-worktree graph."""
+    root = Path(repo_root).resolve(strict=True)
+    lifecycle = load_lifecycle()
+    validator = (
+        getattr(lifecycle, "inspect_under_lock")
+        if lock_held
+        else getattr(lifecycle, "inspect")
+    )
+    result = validator(root if lock_held else str(root))
+    if not result.get("usable"):
+        raise RuntimeError(f"CRG graph is unusable: {result.get('reason', 'unknown')}")
+    data_dir = root / ".code-review-graph"
+    if data_dir.is_symlink():
+        raise RuntimeError("CRG graph directory is a symlink")
+    database = (data_dir / "graph.db").resolve(strict=True)
+    if database.parent != data_dir.resolve(strict=True):
+        raise RuntimeError("CRG database is outside the exact worktree")
+    return database
+
+
+def readonly_data_dir(repo_root: Path, *, create: bool = True) -> Path:
+    """Preserve upstream's interface while refusing its write intent."""
+    del create
+    return readonly_database(repo_root).parent
+
+
+def readonly_db_path(repo_root: Path, *, read_only: bool = False) -> Path:
+    """Preserve upstream's interface while always returning a read-only path."""
+    del read_only
+    return readonly_database(repo_root)
+
+
+def readonly_graph_store_init(store: object, db_path: str | Path) -> None:
+    database = Path(db_path).resolve(strict=True)
+    data_dir = database.parent
+    if data_dir.name != ".code-review-graph":
+        raise sqlite3.OperationalError("CRG database is outside the managed graph path")
+    repo_root = data_dir.parent.resolve(strict=True)
+    reader_lock = open_worktree_reader_lock(repo_root)
+    connection: sqlite3.Connection | None = None
+    try:
+        validated_database = readonly_database(repo_root, lock_held=True)
+        if validated_database != database:
+            raise RuntimeError("CRG database changed while acquiring its lifecycle lock")
+        connection = sqlite3.connect(
+            f"{database.as_uri()}?mode=ro&immutable=1",
+            uri=True,
+            timeout=5,
+            check_same_thread=False,
+            isolation_level=None,
+        )
+        connection.row_factory = sqlite3.Row
+        # `mode=ro&immutable=1` is the write boundary for graph.db and its sidecars.
+        # `query_only=ON` added nothing there, but it also blocked the per-connection
+        # temp database that the impact-radius seed table needs, so both impact tools
+        # failed outright. Keep temp pages in memory instead so they die with the
+        # connection. `query_only` did carry one thing beyond this file: it blocked
+        # ATTACH and VACUUM INTO against arbitrary writable paths. Cap attached
+        # databases at zero to keep exactly that, since `main` and `temp` occupy
+        # fixed slots and are not counted.
+        connection.execute("PRAGMA temp_store=MEMORY")
+        connection.setlimit(sqlite3.SQLITE_LIMIT_ATTACHED, 0)
+        store.db_path = database
+        store._conn = connection
+        store._reader_lock_handle = reader_lock
+        store._nxg_cache = None
+        store._cache_lock = threading.Lock()
+    except Exception:
+        if connection is not None:
+            connection.close()
+        fcntl.flock(reader_lock.fileno(), fcntl.LOCK_UN)
+        reader_lock.close()
+        raise
+
+
+def readonly_graph_store_close(store: object) -> None:
+    store._conn.close()
+    reader_lock = store._reader_lock_handle
+    fcntl.flock(reader_lock.fileno(), fcntl.LOCK_UN)
+    reader_lock.close()
+
+
+def readonly_embedding_store_init(
+    store: object,
+    db_path: str | Path,
+    provider: str | None = None,
+    model: str | None = None,
+) -> None:
+    from code_review_graph.embeddings import get_provider
+
+    database = Path(db_path).resolve(strict=True)
+    data_dir = database.parent
+    if data_dir.name != ".code-review-graph":
+        raise sqlite3.OperationalError("CRG database is outside the managed graph path")
+    repo_root = data_dir.parent.resolve(strict=True)
+    reader_lock = open_worktree_reader_lock(repo_root)
+    connection: sqlite3.Connection | None = None
+    try:
+        validated_database = readonly_database(repo_root, lock_held=True)
+        if validated_database != database:
+            raise RuntimeError("CRG database changed while acquiring its lifecycle lock")
+        connection = sqlite3.connect(
+            f"{database.as_uri()}?mode=ro&immutable=1",
+            uri=True,
+            timeout=5,
+            check_same_thread=False,
+            isolation_level=None,
+        )
+        connection.row_factory = sqlite3.Row
+        # `mode=ro&immutable=1` is the write boundary for graph.db and its sidecars.
+        # `query_only=ON` added nothing there, but it also blocked the per-connection
+        # temp database that the impact-radius seed table needs, so both impact tools
+        # failed outright. Keep temp pages in memory instead so they die with the
+        # connection. `query_only` did carry one thing beyond this file: it blocked
+        # ATTACH and VACUUM INTO against arbitrary writable paths. Cap attached
+        # databases at zero to keep exactly that, since `main` and `temp` occupy
+        # fixed slots and are not counted.
+        connection.execute("PRAGMA temp_store=MEMORY")
+        connection.setlimit(sqlite3.SQLITE_LIMIT_ATTACHED, 0)
+        store.provider = get_provider(provider, model=model)
+        store.available = store.provider is not None
+        store.db_path = database
+        store._conn = connection
+        store._reader_lock_handle = reader_lock
+        store._has_embeddings = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='embeddings'"
+        ).fetchone() is not None
+    except Exception:
+        if connection is not None:
+            connection.close()
+        fcntl.flock(reader_lock.fileno(), fcntl.LOCK_UN)
+        reader_lock.close()
+        raise
+
+
+def readonly_embedding_store_close(store: object) -> None:
+    store._conn.close()
+    reader_lock = store._reader_lock_handle
+    fcntl.flock(reader_lock.fileno(), fcntl.LOCK_UN)
+    reader_lock.close()
+
+
+def readonly_embedding_count(store: object) -> int:
+    if not store._has_embeddings:
+        return 0
+    return int(store._conn.execute("SELECT COUNT(*) FROM embeddings").fetchone()[0])
+
+
+def readonly_graph_provenance(repo_root: str | None = None) -> dict[str, Any] | None:
+    """Read build provenance through the same immutable, locked store."""
+    from code_review_graph import graph, incremental
+    from code_review_graph.tools import _common
+
+    try:
+        root = _common._resolve_root(repo_root)
+        store = graph.GraphStore(incremental.get_db_path(root))
+        try:
+            rows = dict(
+                store._conn.execute(
+                    "SELECT key, value FROM metadata WHERE key IN "
+                    "('last_updated', 'git_branch', 'git_head_sha')"
+                ).fetchall()
+            )
+        finally:
+            store.close()
+
+        updated_at = rows.get("last_updated")
+        if not isinstance(updated_at, str) or not updated_at:
+            return None
+        provenance: dict[str, Any] = {"updated_at": updated_at}
+        try:
+            built_at = datetime.fromisoformat(updated_at)
+            now = datetime.now(tz=built_at.tzinfo)
+            provenance["age_seconds"] = max(
+                0,
+                int((now - built_at).total_seconds()),
+            )
+        except (OverflowError, TypeError, ValueError):
+            pass
+
+        branch = rows.get("git_branch")
+        if isinstance(branch, str) and branch:
+            provenance["built_on_branch"] = branch
+        built_head = rows.get("git_head_sha")
+        if isinstance(built_head, str) and built_head:
+            provenance["built_at_sha"] = built_head
+        live_head = _common._read_live_git_head(root)
+        if live_head:
+            provenance["head_sha"] = live_head
+            if isinstance(built_head, str) and built_head:
+                provenance["head_matches_build"] = live_head == built_head
+        return provenance
+    except Exception:
+        return None
+
+
+def install_readonly_patches() -> None:
+    from code_review_graph import embeddings, graph, incremental, main
+    from code_review_graph.tools import _common
+
+    graph.GraphStore.__init__ = readonly_graph_store_init
+    graph.GraphStore.close = readonly_graph_store_close
+    embeddings.EmbeddingStore.__init__ = readonly_embedding_store_init
+    embeddings.EmbeddingStore.close = readonly_embedding_store_close
+    embeddings.EmbeddingStore.count = readonly_embedding_count
+    incremental.get_data_dir = readonly_data_dir
+    incremental.get_db_path = readonly_db_path
+    main.get_db_path = readonly_db_path
+    _common.get_db_path = readonly_db_path
+    _common.graph_provenance = readonly_graph_provenance
+
+
+def normalized_readonly_arguments(arguments: list[str]) -> list[str]:
+    """Return one strict stdio argv with a validated read-only tool selection."""
+    if not arguments or arguments[0] != "serve":
+        raise ValueError("code-review-graph-readonly only supports MCP stdio serve")
+
+    normalized = ["serve"]
+    selections: list[str] = []
+    index = 1
+    while index < len(arguments):
+        argument = arguments[index]
+        if argument == "--repo":
+            if index + 1 >= len(arguments) or not arguments[index + 1]:
+                raise ValueError("--repo requires a non-empty path")
+            normalized.extend(["--repo", arguments[index + 1]])
+            index += 2
+            continue
+        if argument.startswith("--repo="):
+            value = argument.partition("=")[2]
+            if not value:
+                raise ValueError("--repo requires a non-empty path")
+            normalized.extend(["--repo", value])
+            index += 1
+            continue
+        if argument == "--tools":
+            if index + 1 >= len(arguments):
+                raise ValueError("--tools requires a comma-separated value")
+            selections.append(arguments[index + 1])
+            index += 2
+            continue
+        elif argument.startswith("--tools="):
+            selections.append(argument.partition("=")[2])
+            index += 1
+            continue
+        raise ValueError(
+            f"code-review-graph-readonly refuses unsupported serve argument: {argument}"
+        )
+
+    requested = [
+        name.strip()
+        for selection in selections
+        for name in selection.split(",")
+        if name.strip()
+    ]
+    if selections and not requested:
+        raise ValueError("--tools requires at least one read-only tool")
+    unsupported = sorted(set(requested) - set(READONLY_TOOLS))
+    if unsupported:
+        raise ValueError(
+            "code-review-graph-readonly refuses non-read-only tools: "
+            + ", ".join(unsupported)
+        )
+    selected = requested or list(READONLY_TOOLS)
+    normalized.extend(["--tools", ",".join(dict.fromkeys(selected))])
+    return normalized
+
+
+def main() -> int:
+    try:
+        normalized = normalized_readonly_arguments(sys.argv[1:])
+    except ValueError as error:
+        print(str(error), file=sys.stderr)
+        return 2
+
+    os.environ.pop("CRG_TOOLS", None)
+    sys.argv = [sys.argv[0], *normalized]
+    install_readonly_patches()
+    from code_review_graph.cli import main as crg_main
+
+    result = crg_main()
+    return int(result or 0)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="zh-Hant">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>HTML Report 壓力測試</title>
+    <style>
+      * { box-sizing: border-box; }
+      html {
+        color: #172221;
+        background: #f4f7f6;
+        font: 16px/1.65 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang TC", sans-serif;
+      }
+      html:lang(zh-Hant) .report-copy { line-break: strict; word-break: normal; }
+      body { margin: 0; }
+      a, code, .breakable { overflow-wrap: anywhere; }
+      .page { width: min(1180px, calc(100% - 40px)); margin: 0 auto; padding: 36px 0 56px; }
+      h1 { max-width: 18em; font-size: clamp(2rem, 6vw, 4rem); line-height: 1.05; text-wrap: balance; }
+      .thesis { max-width: 36em; font-size: clamp(1.3rem, 3vw, 2rem); font-weight: 750; }
+      .summary, .report-copy p, .report-copy li { max-width: 72ch; }
+      html:lang(zh-Hant) .summary,
+      html:lang(zh-Hant) .report-copy p,
+      html:lang(zh-Hant) .report-copy li { max-width: 64em; }
+      .meta { display: flex; flex-wrap: wrap; gap: 8px; margin: 24px 0 44px; }
+      [data-report-meta-token] {
+        padding: 6px 10px;
+        border: 1px solid #d9e2df;
+        border-radius: 999px;
+        white-space: nowrap;
+      }
+      .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; }
+      .panel { min-width: 0; padding: 18px; border: 1px solid #d9e2df; background: white; }
+      .table-wrap { max-width: 100%; overflow-x: auto; border: 1px solid #d9e2df; }
+      table { width: 100%; border-collapse: collapse; }
+      th, td { min-width: 10rem; padding: 12px; text-align: left; border-bottom: 1px solid #d9e2df; }
+      pre { max-width: 100%; overflow-x: auto; padding: 14px; background: #172221; color: white; }
+      @media (max-width: 640px) {
+        .page { width: min(100% - 24px, 1180px); padding-top: 18px; }
+        .grid { grid-template-columns: 1fr; }
+      }
+      @media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } }
+      @media print {
+        body { background: white; }
+        .page { width: 100%; padding: 0; }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="page">
+      <header>
+        <h1 data-report-identity>HTML Report 壓力測試</h1>
+        <p class="thesis" data-report-thesis>中文、英文、資料與版面在不同寬度下仍自然閱讀</p>
+        <p class="summary">這份樣本同時覆蓋長段落、日期、App/Web 混排、清單、路徑、程式碼與寬表格。</p>
+        <div class="meta">
+          <span data-report-meta-token>2026-09-01 14:30 +08:00</span>
+          <span data-report-meta-token>狀態：已交付</span>
+          <span data-report-meta-token>版本：v2026.09.01</span>
+        </div>
+      </header>
+      <main class="report-copy">
+        <section>
+          <h2>長中文段落</h2>
+          <p>教練設定課表在指定日期自動解鎖後，合理期待是時間到了，會員就能直接看到內容。伺服器應在每次讀取時回傳同一個結果，App 與 Web 也應在下一個解鎖時間重新取得，而不是各自依賴舊資料、快取或背景工作猜測目前狀態。</p>
+          <ul>
+            <li>日期與狀態保持完整，外層資訊列可以依畫面寬度自然換列。</li>
+            <li>像管理後台、App、Web、TRACK-1932 這類混合文字不應造成不必要的人工斷行。</li>
+          </ul>
+        </section>
+        <section class="grid">
+          <article class="panel">
+            <h2>一般內容</h2>
+            <p>正文維持自然行寬，在筆電與 compact pane 都不需要水平捲動。</p>
+          </article>
+          <article class="panel">
+            <h2>不可預測字串</h2>
+            <p class="breakable">/Users/example/a-very-long-report-path/with-an-opaque-identifier-0123456789abcdef/report.html</p>
+          </article>
+        </section>
+        <section>
+          <h2>寬內容留在自己的容器</h2>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>入口</th><th>改動前</th><th>改動後</th><th>證據</th></tr></thead>
+              <tbody><tr><td>App</td><td>各自猜測</td><td>伺服器統一回應</td><td>TRACK-1932</td></tr></tbody>
+            </table>
+          </div>
+          <pre><code>python3 validate_html_report.py report.html --portable</code></pre>
+        </section>
+      </main>
+    </div>
+  </body>
+</html>

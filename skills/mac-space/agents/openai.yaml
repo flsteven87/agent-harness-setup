@@ -1,0 +1,6 @@
+interface:
+  display_name: "Mac Space"
+  short_description: "Free Mac disk space through the shared cleanup rules"
+  default_prompt: "Use $mac-space to clean this Mac's disk space and report what was freed and what keeps growing."
+policy:
+  allow_implicit_invocation: true

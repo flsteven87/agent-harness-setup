@@ -1,0 +1,6 @@
+interface:
+  display_name: "Rehydrate"
+  short_description: "Reload codebase texture after context loss"
+  default_prompt: "Use $rehydrate to rebuild the active task's texture from files and confirm the queued step still serves the endgame."
+policy:
+  allow_implicit_invocation: true

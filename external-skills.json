@@ -1,0 +1,17 @@
+{
+  "skills_cli": "skills@1.7.2",
+  "matt": {
+    "repo": "https://github.com/mattpocock/skills",
+    "commit": "49dd158d1076134a641b33efb035946536778336",
+    "exclude": {
+      "handoff": "our handoff writes the shared MEMORY.md checkpoint and replaces upstream's"
+    }
+  },
+  "impeccable_claude_agents": {
+    "repo": "https://github.com/pbakaus/impeccable",
+    "skill": "impeccable",
+    "upstream_skill_path": ".agents/skills/impeccable",
+    "upstream_agents_path": ".claude/agents",
+    "target": "claude/agents"
+  }
+}

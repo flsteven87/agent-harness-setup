@@ -1,0 +1,115 @@
+#!/bin/sh
+""":"
+exec "${HOME}/.local/share/uv/tools/code-review-graph/bin/python" "$0" "$@"
+":"""
+# Run a staged CRG build or update with an isolated upstream registry.
+
+from __future__ import annotations
+
+import os
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+
+CONTROL_ROOT = Path(
+    (
+        os.environ.get("CRG_CONTROL_ROOT", str(Path.home() / '.code-review-graph'))
+        if os.environ.get("CRG_TEST_MODE") == "1"
+        else str(Path.home() / '.code-review-graph')
+    )
+).expanduser().resolve()
+
+
+def stored_commit_is_ancestor(repo: Path, stage: Path) -> bool:
+    """Keep provenance promotion on the same Git history."""
+    from code_review_graph.graph import GraphStore
+
+    store = GraphStore(stage / "graph.db")
+    try:
+        stored_head = store.get_metadata("git_head_sha")
+    finally:
+        store.close()
+    if not stored_head:
+        return False
+    result = subprocess.run(
+        ["git", "-C", str(repo), "merge-base", "--is-ancestor", stored_head, "HEAD"],
+        capture_output=True,
+        timeout=30,
+        check=False,
+        stdin=subprocess.DEVNULL,
+    )
+    return result.returncode == 0
+
+
+def advance_update_provenance(repo: Path, stage: Path) -> None:
+    """Complete CRG's metadata-only no-op update on the isolated stage.
+
+    CRG 2.3.8 updates git_head_sha only when it reparses or removes a file.
+    Its MCP context tool rejects an otherwise-current graph at an older SHA.
+    Reusing CRG's own metadata writer keeps this shim narrow and idempotent.
+    """
+    if not stored_commit_is_ancestor(repo, stage):
+        return
+    from code_review_graph.graph import GraphStore
+    from code_review_graph.incremental import _store_vcs_metadata
+
+    store = GraphStore(stage / "graph.db")
+    try:
+        _store_vcs_metadata(repo, store)
+        store.commit()
+    finally:
+        store.close()
+
+
+def main() -> int:
+    if len(sys.argv) not in {4, 5} or sys.argv[1] not in {"build", "update"}:
+        print(
+            "Usage: crg-isolated-build {build REPO STAGE|update REPO STAGE BASE}",
+            file=sys.stderr,
+        )
+        return 2
+    mode = sys.argv[1]
+    if mode == "build" and len(sys.argv) != 4:
+        return 2
+    if mode == "update" and len(sys.argv) != 5:
+        return 2
+
+    repo = Path(sys.argv[2]).resolve(strict=True)
+    stage = Path(sys.argv[3]).resolve(strict=False)
+    base = sys.argv[4] if mode == "update" else None
+    CONTROL_ROOT.mkdir(parents=True, exist_ok=True)
+
+    with tempfile.TemporaryDirectory(
+        prefix="isolated-registry-",
+        dir=CONTROL_ROOT,
+    ) as temporary:
+        from code_review_graph import registry
+
+        isolated_root = Path(temporary)
+        registry._REGISTRY_DIR = isolated_root
+        registry._REGISTRY_PATH = isolated_root / "registry.json"
+
+        from code_review_graph.cli import main as crg_main
+
+        arguments = [
+            "code-review-graph",
+            mode,
+            "--repo",
+            str(repo),
+            "--data-dir",
+            str(stage),
+        ]
+        if base is not None:
+            arguments.extend(["--base", base])
+        arguments.extend(["--quiet", "--skip-flows"])
+        sys.argv = arguments
+        result = int(crg_main() or 0)
+        if result == 0 and mode == "update":
+            advance_update_provenance(repo, stage)
+        return result
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

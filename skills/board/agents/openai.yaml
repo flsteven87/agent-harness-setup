@@ -1,0 +1,6 @@
+interface:
+  display_name: "Board"
+  short_description: "Manager page: what shipped, what waits on me, what to do first"
+  default_prompt: "Use $board to open this project's board and tell me what waits on my decision."
+policy:
+  allow_implicit_invocation: true

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Design benchmark"
+  short_description: "Research the category with parallel agents, decide, then redraw the design target"
+  default_prompt: "Use $design-benchmark to research how the best 2026 products design this surface and redraw our SSOT from the evidence."

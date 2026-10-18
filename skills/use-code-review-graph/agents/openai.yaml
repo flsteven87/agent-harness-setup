@@ -1,0 +1,4 @@
+interface:
+  display_name: "Use Code Review Graph"
+  short_description: "Safely query and refresh worktree code graphs"
+  default_prompt: "Use $use-code-review-graph to inspect this change with a fresh, token-efficient structural graph."

@@ -1,0 +1,6 @@
+interface:
+  display_name: "Ship"
+  short_description: "Deliver a completed commit through the repo's own path"
+  default_prompt: "Use $ship to deliver the completed local commit through this repository's existing direct-push or pull-request path, applicable checks and deployment, optional owning-work-item synchronization, and exact task-branch cleanup."
+policy:
+  allow_implicit_invocation: true

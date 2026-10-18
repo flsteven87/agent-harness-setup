@@ -1,0 +1,35 @@
+{
+  "skill_name": "design-benchmark",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "我們 docs/design/index.html 的 SSOT 改了五輪還是不滿意，尤其 Item detail 和 Settings。請你派 Opus 5 去研究 2026 業界的 iOS 閱讀 app 怎麼設計這些頁面，也看設計網站，回來後告訴我該怎麼改。",
+      "expected_output": "An intake tied to the current target revision, the owner's recent decisions, existing research and current screenshots; parallel Opus tracks with distinct questions and a differentiator track only for an uncovered mechanism; reports with evidence types, measurement provenance and stable recommendation IDs; the premises behind proposed changes verified by the main session; one Traditional Chinese synthesis with change IDs and the reports appended; a one-screen decision summary; the SSOT unchanged while approval is pending.",
+      "files": []
+    },
+    {
+      "id": 2,
+      "prompt": "The example agent dashboard proposal in docs/research/agent-settings-components.html still feels generic. Benchmark how Intercom Fin, Dust, Voiceflow and the other 2026 agent builders structure the inside of one agent and their components, then tell me what to change. After I approve, rewrite the HTML.",
+      "expected_output": "Flows and Components tracks on Opus, a third only for a distinct uncovered question; a synthesis with a supported diagnosis, change IDs, decision dependencies and acceptance conditions; a stop at the gate because the owner asked for approval first; after approval one authorized HTML pass with documentation reconciliation, rendering across the agreed matrix, corrections followed by re-rendering, and separate commits.",
+      "files": []
+    },
+    {
+      "id": 3,
+      "prompt": "全權授權：根據 docs/reading-app-design-benchmark-2026-09-17.md 第八節把 SSOT HTML 改到位，gate 要綠，契約和 decision log 一起改。",
+      "expected_output": "Entry at step 6: read the existing synthesis, the current target and contract, and the authorization; reuse the research without redispatch; record the recommended options as accepted under full authority; change the SSOT, contract, decision log and gate together; change only the mechanically coupled native values the gate compares; verify the final candidate after corrections; commit the design pass separately from the already committed research note; report pending native work.",
+      "files": []
+    },
+    {
+      "id": 4,
+      "prompt": "The Settings heading still feels wrong after several rounds. Change its label to Account and keep this task to that copy edit.",
+      "expected_output": "No benchmark: the bounded copy change is made directly without research tracks or a synthesis note.",
+      "files": []
+    },
+    {
+      "id": 5,
+      "prompt": "Use the existing benchmark synthesis in docs/. Apply change 1 only. Leave decision 2 open and keep everything that depends on it out of this pass.",
+      "expected_output": "Entry at step 6 with partial authorization recorded; change 1 and its authorized prerequisites applied and verified on the final candidate; changes depending on decision 2 deferred and named in the closing report.",
+      "files": []
+    }
+  ]
+}

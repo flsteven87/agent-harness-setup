@@ -1,0 +1,6 @@
+interface:
+  display_name: "Reverse Thinking"
+  short_description: "Work backwards from the endgame to audit or forge a plan"
+  default_prompt: "Use $reverse-thinking to work backwards from the endgame of the current plan or idea."
+policy:
+  allow_implicit_invocation: true

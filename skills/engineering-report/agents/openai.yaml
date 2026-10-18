@@ -1,0 +1,6 @@
+interface:
+  display_name: "Engineering Report"
+  short_description: "Turn engineering evidence into business-first updates"
+  default_prompt: "Use $engineering-report to create an evidence-backed engineering update for the requested contributor or team and time window."
+policy:
+  allow_implicit_invocation: true

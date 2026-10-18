@@ -1,0 +1,5 @@
+interface:
+  display_name: "AI SEO"
+  short_description: "Optimize content to be cited by AI search engines (AEO/GEO)"
+policy:
+  allow_implicit_invocation: false

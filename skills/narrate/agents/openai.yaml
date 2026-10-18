@@ -1,0 +1,6 @@
+interface:
+  display_name: "Narrate"
+  short_description: "Explain user impact and business consequences"
+  default_prompt: "Use $narrate to explain this subject in plain language, starting with what users experience and why it matters."
+policy:
+  allow_implicit_invocation: false

@@ -1,0 +1,6 @@
+interface:
+  display_name: "Setup Hygiene"
+  short_description: "Audit user-level setup integrity and drift"
+  default_prompt: "Use $setup-hygiene to audit and safely repair user-level agent setup drift."
+policy:
+  allow_implicit_invocation: false
